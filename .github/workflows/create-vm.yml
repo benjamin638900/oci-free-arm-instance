@@ -1,0 +1,83 @@
+name: Try to Create OCI VM
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+env:
+  COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+  IMAGE_ID: ${{ secrets.IMAGE_ID }}
+  SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+  OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+  OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+  OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+  OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+  OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+  AD_NAMES: "QNKM:PHX-AD-1 QNKM:PHX-AD-2 QNKM:PHX-AD-3"
+
+jobs:
+  try-create-vm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cache OCI CLI
+        uses: actions/cache@v4
+        with:
+          path: ~/.local
+          key: ${{ runner.os }}-pip-oci-cli-v1
+
+      - name: Add OCI CLI to PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install OCI CLI
+        run: pip install --user oci-cli
+
+      - name: Configure OCI CLI
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "${OCI_CLI_KEY_CONTENT}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${OCI_CLI_USER}
+          tenancy=${OCI_CLI_TENANCY}
+          fingerprint=${OCI_CLI_FINGERPRINT}
+          key_file=~/.oci/oci_api_key.pem
+          region=${OCI_CLI_REGION}
+          EOF
+
+          printf '%s\n' "${{ secrets.SSH_PUBLIC_KEY }}" > /tmp/ssh_key.pub
+
+      - name: Try to create ARM VM in each Phoenix AD
+        run: |
+          set +e
+
+          for AD_NAME in $AD_NAMES; do
+            echo "Trying availability domain: $AD_NAME"
+
+            OCI_OUTPUT=$(oci compute instance launch \
+              --compartment-id "$COMPARTMENT_ID" \
+              --availability-domain "$AD_NAME" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+              --subnet-id "$SUBNET_ID" \
+              --image-id "$IMAGE_ID" \
+              --ssh-authorized-keys-file "/tmp/ssh_key.pub" \
+              --assign-public-ip true \
+              --display-name "oci-free-arm-vm" \
+              --boot-volume-size-in-gbs 100 2>&1)
+
+            EXIT_CODE=$?
+            echo "$OCI_OUTPUT"
+
+            if [ "$EXIT_CODE" -eq 0 ] && echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
+              echo "VM creation started successfully in $AD_NAME."
+              exit 0
+            fi
+
+            echo "Not created in $AD_NAME. Trying next AD if available."
+          done
+
+          echo "VM not created yet. This is expected when OCI reports out of capacity."
+          exit 1
