@@ -99,40 +99,54 @@ jobs:
             exit 1
           fi
 
-          set +e
-          OCI_OUTPUT=$(oci compute instance launch \
-            --compartment-id "$COMPARTMENT_ID" \
-            --availability-domain "$AD_NAME" \
-            --shape "VM.Standard.A1.Flex" \
-            --shape-config '{"ocpus":2,"memoryInGBs":12}' \
-            --subnet-id "$SUBNET_ID" \
-            --source-details "{\"sourceType\":\"bootVolume\",\"bootVolumeId\":\"${BOOT_VOLUME_ID}\"}" \
-            --assign-public-ip true \
-            --display-name "$INSTANCE_NAME" \
-            --freeform-tags '{"free-tier-recovery":"retained-boot-volume"}' \
-            --query 'data.{id:id,state:"lifecycle-state",shape:shape,ocpus:"shape-config".ocpus,memoryGB:"shape-config"."memory-in-gbs"}' \
-            2>&1)
-          EXIT_CODE=$?
-          set -e
+          for ATTEMPT in $(seq 1 6); do
+            echo "Capacity attempt $ATTEMPT of 6 in $AD_NAME"
 
-          echo "$OCI_OUTPUT"
-          if [ "$EXIT_CODE" -ne 0 ]; then
-            echo "Instance not created yet; OCI capacity is unavailable."
-            exit 1
-          fi
+            set +e
+            OCI_OUTPUT=$(oci compute instance launch \
+              --compartment-id "$COMPARTMENT_ID" \
+              --availability-domain "$AD_NAME" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+              --subnet-id "$SUBNET_ID" \
+              --source-details "{\"sourceType\":\"bootVolume\",\"bootVolumeId\":\"${BOOT_VOLUME_ID}\"}" \
+              --assign-public-ip true \
+              --display-name "$INSTANCE_NAME" \
+              --freeform-tags '{"free-tier-recovery":"retained-boot-volume"}' \
+              --query 'data.{id:id,state:"lifecycle-state",shape:shape,ocpus:"shape-config".ocpus,memoryGB:"shape-config"."memory-in-gbs"}' \
+              2>&1)
+            EXIT_CODE=$?
+            set -e
 
-          INSTANCE_ID=$(echo "$OCI_OUTPUT" | jq -r '.id')
-          echo "Instance creation accepted: $INSTANCE_ID"
+            echo "$OCI_OUTPUT"
+            if [ "$EXIT_CODE" -ne 0 ]; then
+              if echo "$OCI_OUTPUT" | grep -Eqi 'Out of host capacity|OUT_OF_CAPACITY'; then
+                echo "Capacity unavailable on attempt $ATTEMPT."
+                [ "$ATTEMPT" -lt 6 ] && sleep 15
+                continue
+              fi
 
-          if oci compute instance get \
-            --instance-id "$INSTANCE_ID" \
-            --wait-for-state RUNNING \
-            --max-wait-seconds 900 \
-            >/tmp/instance-running.json; then
-            cat /tmp/instance-running.json
-            echo "Instance is RUNNING. Disabling future retries."
-            disable_workflow
-          else
+              echo "OCI returned a non-capacity error; stopping instead of retrying it."
+              exit 1
+            fi
+
+            INSTANCE_ID=$(echo "$OCI_OUTPUT" | jq -r '.id')
+            echo "Instance creation accepted: $INSTANCE_ID"
+
+            if oci compute instance get \
+              --instance-id "$INSTANCE_ID" \
+              --wait-for-state RUNNING \
+              --max-wait-seconds 900 \
+              >/tmp/instance-running.json; then
+              cat /tmp/instance-running.json
+              echo "Instance is RUNNING. Disabling future retries."
+              disable_workflow
+              exit 0
+            fi
+
             echo "Instance was accepted but is not RUNNING yet. A later run will recheck it without creating a duplicate."
             exit 1
-          fi
+          done
+
+          echo "All six attempts ended with OCI capacity unavailable."
+          exit 1
