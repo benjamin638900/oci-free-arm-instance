@@ -2,23 +2,33 @@ name: Try to Create OCI VM
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: oci-free-arm-instance
+  cancel-in-progress: false
 
 env:
   COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
-  IMAGE_ID: ${{ secrets.IMAGE_ID }}
   SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+  BOOT_VOLUME_ID: ${{ secrets.OCI_BOOT_VOLUME_ID }}
   OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
   OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
   OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
   OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
   OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
-  AD_NAMES: "QNKM:PHX-AD-1 QNKM:PHX-AD-2 QNKM:PHX-AD-3"
+  AD_NAME: QNKM:PHX-AD-3
+  INSTANCE_NAME: oci-free-arm-vm
 
 jobs:
   try-create-vm:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - name: Cache OCI CLI
         uses: actions/cache@v4
@@ -47,37 +57,82 @@ jobs:
           region=${OCI_CLI_REGION}
           EOF
 
-          printf '%s\n' "${{ secrets.SSH_PUBLIC_KEY }}" > /tmp/ssh_key.pub
-
-      - name: Try to create ARM VM in each Phoenix AD
+      - name: Reuse retained boot volume and create A1 instance
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          set +e
+          set -euo pipefail
 
-          for AD_NAME in $AD_NAMES; do
-            echo "Trying availability domain: $AD_NAME"
+          disable_workflow() {
+            gh workflow disable create-vm.yml --repo "$GITHUB_REPOSITORY" || true
+          }
 
-            OCI_OUTPUT=$(oci compute instance launch \
-              --compartment-id "$COMPARTMENT_ID" \
-              --availability-domain "$AD_NAME" \
-              --shape "VM.Standard.A1.Flex" \
-              --shape-config '{"ocpus":4,"memoryInGBs":24}' \
-              --subnet-id "$SUBNET_ID" \
-              --image-id "$IMAGE_ID" \
-              --ssh-authorized-keys-file "/tmp/ssh_key.pub" \
-              --assign-public-ip true \
-              --display-name "oci-free-arm-vm" \
-              --boot-volume-size-in-gbs 100 2>&1)
+          EXISTING_ID=$(oci compute instance list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --all \
+            --query 'data[?"display-name"==`oci-free-arm-vm` && "lifecycle-state"!=`TERMINATED`].id | [0]' \
+            --raw-output)
 
-            EXIT_CODE=$?
-            echo "$OCI_OUTPUT"
-
-            if [ "$EXIT_CODE" -eq 0 ] && echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
-              echo "VM creation started successfully in $AD_NAME."
-              exit 0
+          if [ -n "$EXISTING_ID" ] && [ "$EXISTING_ID" != "None" ]; then
+            EXISTING_STATE=$(oci compute instance get \
+              --instance-id "$EXISTING_ID" \
+              --query 'data."lifecycle-state"' \
+              --raw-output)
+            echo "Instance already exists: $EXISTING_ID ($EXISTING_STATE)."
+            if [ "$EXISTING_STATE" = "RUNNING" ] || [ "$EXISTING_STATE" = "STOPPED" ]; then
+              disable_workflow
             fi
+            exit 0
+          fi
 
-            echo "Not created in $AD_NAME. Trying next AD if available."
-          done
+          BOOT_INFO=$(oci bv boot-volume get \
+            --boot-volume-id "$BOOT_VOLUME_ID" \
+            --query 'data.{state:"lifecycle-state",ad:"availability-domain",sizeGB:"size-in-gbs"}')
+          echo "Retained boot volume: $BOOT_INFO"
 
-          echo "VM not created yet. This is expected when OCI reports out of capacity."
-          exit 1
+          BOOT_STATE=$(echo "$BOOT_INFO" | jq -r '.state')
+          BOOT_AD=$(echo "$BOOT_INFO" | jq -r '.ad')
+          BOOT_SIZE=$(echo "$BOOT_INFO" | jq -r '.sizeGB')
+
+          if [ "$BOOT_STATE" != "AVAILABLE" ] || [ "$BOOT_AD" != "$AD_NAME" ] || [ "$BOOT_SIZE" != "100" ]; then
+            echo "Boot volume must be AVAILABLE, 100 GB, and in $AD_NAME."
+            exit 1
+          fi
+
+          set +e
+          OCI_OUTPUT=$(oci compute instance launch \
+            --compartment-id "$COMPARTMENT_ID" \
+            --availability-domain "$AD_NAME" \
+            --shape "VM.Standard.A1.Flex" \
+            --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+            --subnet-id "$SUBNET_ID" \
+            --source-details "{\"sourceType\":\"bootVolume\",\"bootVolumeId\":\"${BOOT_VOLUME_ID}\"}" \
+            --assign-public-ip true \
+            --display-name "$INSTANCE_NAME" \
+            --freeform-tags '{"free-tier-recovery":"retained-boot-volume"}' \
+            --query 'data.{id:id,state:"lifecycle-state",shape:shape,ocpus:"shape-config".ocpus,memoryGB:"shape-config"."memory-in-gbs"}' \
+            2>&1)
+          EXIT_CODE=$?
+          set -e
+
+          echo "$OCI_OUTPUT"
+          if [ "$EXIT_CODE" -ne 0 ]; then
+            echo "Instance not created yet; OCI capacity is unavailable."
+            exit 1
+          fi
+
+          INSTANCE_ID=$(echo "$OCI_OUTPUT" | jq -r '.id')
+          echo "Instance creation accepted: $INSTANCE_ID"
+
+          if oci compute instance get \
+            --instance-id "$INSTANCE_ID" \
+            --wait-for-state RUNNING \
+            --max-wait-seconds 900 \
+            >/tmp/instance-running.json; then
+            cat /tmp/instance-running.json
+            echo "Instance is RUNNING. Disabling future retries."
+            disable_workflow
+          else
+            echo "Instance was accepted but is not RUNNING yet. A later run will recheck it without creating a duplicate."
+            exit 1
+          fi
