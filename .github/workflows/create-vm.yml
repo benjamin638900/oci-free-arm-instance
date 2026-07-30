@@ -22,6 +22,8 @@ env:
   OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
   OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
   OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+  OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+  SUPPRESS_LABEL_WARNING: "True"
   AD_NAME: QNKM:PHX-AD-3
   INSTANCE_NAME: oci-free-arm-vm
 
@@ -31,7 +33,7 @@ jobs:
     timeout-minutes: 70
     steps:
       - name: Cache OCI CLI
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.local
           key: ${{ runner.os }}-pip-oci-cli-v1
@@ -63,29 +65,73 @@ jobs:
         run: |
           set -euo pipefail
 
+          oci_fast() {
+            oci --no-retry --connection-timeout 5 --read-timeout 20 "$@"
+          }
+
           disable_workflow() {
             gh workflow disable create-vm.yml --repo "$GITHUB_REPOSITORY" || true
           }
 
-          EXISTING_ID=$(oci compute instance list \
-            --compartment-id "$COMPARTMENT_ID" \
-            --all \
-            --query 'data[?"display-name"==`oci-free-arm-vm` && "lifecycle-state"!=`TERMINATED`].id | [0]' \
-            --raw-output)
+          queue_next_run() {
+            local next_run_at
 
-          if [ -n "$EXISTING_ID" ] && [ "$EXISTING_ID" != "None" ]; then
-            EXISTING_STATE=$(oci compute instance get \
-              --instance-id "$EXISTING_ID" \
-              --query 'data."lifecycle-state"' \
-              --raw-output)
-            echo "Instance already exists: $EXISTING_ID ($EXISTING_STATE)."
-            if [ "$EXISTING_STATE" = "RUNNING" ] || [ "$EXISTING_STATE" = "STOPPED" ]; then
+            next_run_at=$(date -u -d '+5 minutes' +%Y-%m-%dT%H:%M:%SZ)
+            echo "Queueing the next retry run for $next_run_at instead of waiting for GitHub's delayed schedule."
+            nohup bash -c '
+              sleep 300
+              gh workflow run create-vm.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
+            ' >/tmp/queue-next-run.log 2>&1 &
+          }
+
+          find_existing_instance() {
+            local output
+
+            if ! output=$(oci_fast compute instance list \
+              --compartment-id "$COMPARTMENT_ID" \
+              --display-name "$INSTANCE_NAME" \
+              --all \
+              --query 'data[?"lifecycle-state"!=`TERMINATED`].{id:id,state:"lifecycle-state"} | [0]' \
+              2>&1); then
+              echo "$output" >&2
+              return 1
+            fi
+
+            printf '%s' "$output"
+          }
+
+          handle_existing_instance() {
+            local existing_info existing_id existing_state
+
+            if ! existing_info=$(find_existing_instance); then
+              echo "Could not check for an existing instance; skipping this launch cycle."
+              return 2
+            fi
+
+            existing_id=$(jq -r '.id // empty' <<<"$existing_info")
+            if [ -z "$existing_id" ]; then
+              return 1
+            fi
+
+            existing_state=$(jq -r '.state' <<<"$existing_info")
+            echo "Instance already exists: $existing_id ($existing_state)."
+            if [ "$existing_state" = "RUNNING" ] || [ "$existing_state" = "STOPPED" ]; then
               disable_workflow
             fi
+            return 0
+          }
+
+          if handle_existing_instance; then
             exit 0
+          else
+            EXISTING_STATUS=$?
+            if [ "$EXISTING_STATUS" -eq 2 ]; then
+              echo "Cannot safely launch without a successful duplicate check."
+              exit 1
+            fi
           fi
 
-          BOOT_INFO=$(oci bv boot-volume get \
+          BOOT_INFO=$(oci_fast bv boot-volume get \
             --boot-volume-id "$BOOT_VOLUME_ID" \
             --query 'data.{state:"lifecycle-state",ad:"availability-domain",sizeGB:"size-in-gbs"}')
           echo "Retained boot volume: $BOOT_INFO"
@@ -99,11 +145,25 @@ jobs:
             exit 1
           fi
 
-          for ATTEMPT in $(seq 1 30); do
-            echo "Capacity attempt $ATTEMPT of 30 in $AD_NAME"
+          END_TIME=$((SECONDS + 60 * 60))
+          ATTEMPT=0
+
+          while [ "$SECONDS" -lt "$END_TIME" ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "Capacity attempt $ATTEMPT in $AD_NAME"
+
+            if handle_existing_instance; then
+              exit 0
+            else
+              EXISTING_STATUS=$?
+              if [ "$EXISTING_STATUS" -eq 2 ]; then
+                sleep $((10 + RANDOM % 11))
+                continue
+              fi
+            fi
 
             set +e
-            OCI_OUTPUT=$(oci compute instance launch \
+            OCI_OUTPUT=$(oci_fast compute instance launch \
               --compartment-id "$COMPARTMENT_ID" \
               --availability-domain "$AD_NAME" \
               --shape "VM.Standard.A1.Flex" \
@@ -120,17 +180,24 @@ jobs:
 
             echo "$OCI_OUTPUT"
             if [ "$EXIT_CODE" -ne 0 ]; then
-              if echo "$OCI_OUTPUT" | grep -Eqi 'Out of host capacity|OUT_OF_CAPACITY'; then
+              if grep -Eqi 'Out of host capacity|OUT_OF_CAPACITY' <<<"$OCI_OUTPUT"; then
                 echo "Capacity unavailable on attempt $ATTEMPT."
-                [ "$ATTEMPT" -lt 30 ] && sleep 15
-                continue
+              elif grep -Eqi 'timed out|timeout|TooManyRequests|429|InternalServerError|BadGateway|ServiceUnavailable|GatewayTimeout|status[" ]*:?[[:space:]]*5[0-9][0-9]' <<<"$OCI_OUTPUT"; then
+                echo "OCI returned a temporary service or network error on attempt $ATTEMPT."
+              else
+                echo "OCI returned a non-retryable error; stopping."
+                exit 1
               fi
 
-              echo "OCI returned a non-capacity error; stopping instead of retrying it."
-              exit 1
+              sleep $((15 + RANDOM % 16))
+              continue
             fi
 
-            INSTANCE_ID=$(echo "$OCI_OUTPUT" | jq -r '.id')
+            INSTANCE_ID=$(jq -r '.id // empty' <<<"$OCI_OUTPUT")
+            if [ -z "$INSTANCE_ID" ]; then
+              echo "OCI returned success without an instance ID; stopping."
+              exit 1
+            fi
             echo "Instance creation accepted: $INSTANCE_ID"
 
             if oci compute instance get \
@@ -148,5 +215,6 @@ jobs:
             exit 1
           done
 
-          echo "All 30 attempts ended with OCI capacity unavailable."
+          echo "Capacity remained unavailable after $ATTEMPT attempts in this one-hour run."
+          queue_next_run
           exit 1
