@@ -176,7 +176,7 @@ jobs:
             if [ "$EXIT_CODE" -ne 0 ]; then
               if grep -Eqi 'Out of host capacity|OUT_OF_CAPACITY' <<<"$OCI_OUTPUT"; then
                 echo "Capacity unavailable on attempt $ATTEMPT."
-              elif grep -Eqi 'timed out|timeout|TooManyRequests|429|InternalServerError|BadGateway|ServiceUnavailable|GatewayTimeout|status[" ]*:?[[:space:]]*5[0-9][0-9]' <<<"$OCI_OUTPUT"; then
+              elif grep -Eqi 'timed out|timeout|TooManyRequests|Too many requests|429|InternalError|InternalServerError|BadGateway|ServiceUnavailable|GatewayTimeout|status[" ]*:?[[:space:]]*5[0-9][0-9]' <<<"$OCI_OUTPUT"; then
                 echo "OCI returned a temporary service or network error on attempt $ATTEMPT."
               else
                 echo "OCI returned a non-retryable error; stopping."
