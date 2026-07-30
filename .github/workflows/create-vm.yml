@@ -28,7 +28,7 @@ env:
 jobs:
   try-create-vm:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 70
     steps:
       - name: Cache OCI CLI
         uses: actions/cache@v4
@@ -99,8 +99,8 @@ jobs:
             exit 1
           fi
 
-          for ATTEMPT in $(seq 1 6); do
-            echo "Capacity attempt $ATTEMPT of 6 in $AD_NAME"
+          for ATTEMPT in $(seq 1 30); do
+            echo "Capacity attempt $ATTEMPT of 30 in $AD_NAME"
 
             set +e
             OCI_OUTPUT=$(oci compute instance launch \
@@ -122,7 +122,7 @@ jobs:
             if [ "$EXIT_CODE" -ne 0 ]; then
               if echo "$OCI_OUTPUT" | grep -Eqi 'Out of host capacity|OUT_OF_CAPACITY'; then
                 echo "Capacity unavailable on attempt $ATTEMPT."
-                [ "$ATTEMPT" -lt 6 ] && sleep 15
+                [ "$ATTEMPT" -lt 30 ] && sleep 15
                 continue
               fi
 
@@ -148,5 +148,5 @@ jobs:
             exit 1
           done
 
-          echo "All six attempts ended with OCI capacity unavailable."
+          echo "All 30 attempts ended with OCI capacity unavailable."
           exit 1
