@@ -74,14 +74,8 @@ jobs:
           }
 
           queue_next_run() {
-            local next_run_at
-
-            next_run_at=$(date -u -d '+5 minutes' +%Y-%m-%dT%H:%M:%SZ)
-            echo "Queueing the next retry run for $next_run_at instead of waiting for GitHub's delayed schedule."
-            nohup bash -c '
-              sleep 300
-              gh workflow run create-vm.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
-            ' >/tmp/queue-next-run.log 2>&1 &
+            echo "Queueing the next retry run instead of waiting for GitHub's delayed schedule."
+            gh workflow run create-vm.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" || true
           }
 
           find_existing_instance() {
