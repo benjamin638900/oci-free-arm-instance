@@ -1,0 +1,333 @@
+name: Prepare OCI AD-1 Recovery Boot Volume
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oci-free-arm-instance
+  cancel-in-progress: false
+
+env:
+  COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+  SOURCE_BOOT_VOLUME_ID: ${{ secrets.OCI_BOOT_VOLUME_ID }}
+  OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+  OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+  OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+  OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+  OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+  OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+  SOURCE_AD: QNKM:PHX-AD-3
+  TARGET_AD: QNKM:PHX-AD-1
+  BACKUP_NAME: oci-free-arm-vm-ad1-recovery-backup
+  TARGET_VOLUME_NAME: oci-free-arm-vm-ad1-recovery
+  INSTANCE_NAME: oci-free-arm-vm
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Cache OCI CLI
+        uses: actions/cache@v5
+        with:
+          path: ~/.local
+          key: ${{ runner.os }}-pip-oci-cli-v1
+
+      - name: Add OCI CLI to PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install OCI CLI
+        run: pip install --user oci-cli
+
+      - name: Configure OCI CLI
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "${OCI_CLI_KEY_CONTENT}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${OCI_CLI_USER}
+          tenancy=${OCI_CLI_TENANCY}
+          fingerprint=${OCI_CLI_FINGERPRINT}
+          key_file=~/.oci/oci_api_key.pem
+          region=${OCI_CLI_REGION}
+          EOF
+
+      - name: Create a full backup and restore it to PHX-AD-1
+        run: |
+          set -euo pipefail
+
+          oci_fast() {
+            oci --no-retry --connection-timeout 5 --read-timeout 30 "$@"
+          }
+
+          redact_ocids() {
+            sed -E 's/ocid1\.[[:alnum:]._-]+/<redacted-ocid>/g'
+          }
+
+          if [ "$OCI_CLI_REGION" != "us-phoenix-1" ]; then
+            echo "Refusing to create storage outside the Always Free home region us-phoenix-1."
+            exit 1
+          fi
+
+          WORK_DIR=$(mktemp -d)
+          trap 'rm -rf "$WORK_DIR"' EXIT
+
+          SOURCE_INFO=$(oci_fast bv boot-volume get \
+            --boot-volume-id "$SOURCE_BOOT_VOLUME_ID" \
+            --query 'data.{state:"lifecycle-state",ad:"availability-domain",sizeGB:"size-in-gbs",vpusPerGB:"vpus-per-gb"}')
+          echo "Source boot volume: $SOURCE_INFO"
+
+          if [ "$(jq -r '.state' <<<"$SOURCE_INFO")" != "AVAILABLE" ] || \
+             [ "$(jq -r '.ad' <<<"$SOURCE_INFO")" != "$SOURCE_AD" ] || \
+             [ "$(jq -r '.sizeGB' <<<"$SOURCE_INFO")" != "100" ]; then
+            echo "The retained source must be AVAILABLE, 100 GB, and in $SOURCE_AD."
+            exit 1
+          fi
+
+          EXISTING_INSTANCE_COUNT=$(oci_fast compute instance list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --display-name "$INSTANCE_NAME" \
+            --all \
+            --query 'length(data[?"lifecycle-state"!=`TERMINATED`])' \
+            --raw-output)
+          if [ "$EXISTING_INSTANCE_COUNT" != "0" ]; then
+            echo "A non-terminated $INSTANCE_NAME instance already exists; refusing to prepare another launch source."
+            exit 1
+          fi
+
+          oci_fast iam availability-domain list \
+            --compartment-id "$OCI_CLI_TENANCY" \
+            >"$WORK_DIR/ads.json"
+          mapfile -t ADS < <(jq -r '.data[].name' "$WORK_DIR/ads.json")
+
+          collect_volume_inventory() {
+            : >"$WORK_DIR/boot-volumes.ndjson"
+            : >"$WORK_DIR/block-volumes.ndjson"
+
+            for AD in "${ADS[@]}"; do
+              oci_fast bv boot-volume list \
+                --compartment-id "$COMPARTMENT_ID" \
+                --availability-domain "$AD" \
+                --all \
+                | jq -c '.data[] | select(.["lifecycle-state"] != "TERMINATED" and .["lifecycle-state"] != "TERMINATING") | {
+                    id: .id,
+                    name: .["display-name"],
+                    availabilityDomain: .["availability-domain"],
+                    sizeGB: .["size-in-gbs"],
+                    state: .["lifecycle-state"],
+                    vpusPerGB: .["vpus-per-gb"]
+                  }' >>"$WORK_DIR/boot-volumes.ndjson"
+
+              oci_fast bv volume list \
+                --compartment-id "$COMPARTMENT_ID" \
+                --availability-domain "$AD" \
+                --all \
+                | jq -c '.data[] | select(.["lifecycle-state"] != "TERMINATED" and .["lifecycle-state"] != "TERMINATING") | {
+                    sizeGB: .["size-in-gbs"]
+                  }' >>"$WORK_DIR/block-volumes.ndjson"
+            done
+          }
+
+          collect_volume_inventory
+          CURRENT_BOOT_GB=$(jq -sc '[.[].sizeGB // 0] | add // 0' "$WORK_DIR/boot-volumes.ndjson")
+          CURRENT_BLOCK_GB=$(jq -sc '[.[].sizeGB // 0] | add // 0' "$WORK_DIR/block-volumes.ndjson")
+          CURRENT_VOLUME_GB=$((CURRENT_BOOT_GB + CURRENT_BLOCK_GB))
+          echo "Current home-region boot + block volume storage: ${CURRENT_VOLUME_GB} GB."
+
+          mapfile -t TARGET_VOLUME_IDS < <(jq -rs --arg name "$TARGET_VOLUME_NAME" --arg ad "$TARGET_AD" '
+            .[] | select(.name == $name and .availabilityDomain == $ad) | .id
+          ' "$WORK_DIR/boot-volumes.ndjson")
+          if [ "${#TARGET_VOLUME_IDS[@]}" -gt 1 ]; then
+            echo "Multiple target boot volumes have the reserved name $TARGET_VOLUME_NAME; refusing to guess."
+            exit 1
+          fi
+          if [ "${#TARGET_VOLUME_IDS[@]}" -eq 0 ] && [ $((CURRENT_VOLUME_GB + 100)) -gt 200 ]; then
+            echo "Restoring 100 GB would exceed the 200 GB Always Free volume allotment."
+            exit 1
+          fi
+
+          oci_fast bv boot-volume-backup list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --all \
+            >"$WORK_DIR/boot-backups.json"
+          oci_fast bv backup list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --all \
+            >"$WORK_DIR/block-backups.json"
+
+          ACTIVE_BOOT_BACKUPS=$(jq '[.data[] | select(.["lifecycle-state"] != "TERMINATED" and .["lifecycle-state"] != "TERMINATING")] | length' "$WORK_DIR/boot-backups.json")
+          ACTIVE_BLOCK_BACKUPS=$(jq '[.data[] | select(.["lifecycle-state"] != "TERMINATED" and .["lifecycle-state"] != "TERMINATING")] | length' "$WORK_DIR/block-backups.json")
+          ACTIVE_BACKUPS=$((ACTIVE_BOOT_BACKUPS + ACTIVE_BLOCK_BACKUPS))
+          echo "Current home-region boot + block volume backups: $ACTIVE_BACKUPS."
+
+          mapfile -t BACKUP_IDS < <(jq -r --arg name "$BACKUP_NAME" '
+            .data[] |
+            select(.["display-name"] == $name and .["lifecycle-state"] != "TERMINATED" and .["lifecycle-state"] != "TERMINATING") |
+            .id
+          ' "$WORK_DIR/boot-backups.json")
+          if [ "${#BACKUP_IDS[@]}" -gt 1 ]; then
+            echo "Multiple boot volume backups have the reserved name $BACKUP_NAME; refusing to guess."
+            exit 1
+          fi
+
+          if [ "${#BACKUP_IDS[@]}" -eq 0 ]; then
+            if [ "$ACTIVE_BACKUPS" -ge 5 ]; then
+              echo "Creating another backup would exceed the five Always Free volume backups."
+              exit 1
+            fi
+
+            echo "Creating one FULL boot volume backup."
+            set +e
+            oci_fast bv boot-volume-backup create \
+              --boot-volume-id "$SOURCE_BOOT_VOLUME_ID" \
+              --display-name "$BACKUP_NAME" \
+              --type FULL \
+              --freeform-tags '{"free-tier-recovery":"ad1-source-backup"}' \
+              >"$WORK_DIR/create-backup.json" 2>"$WORK_DIR/create-backup.err"
+            CREATE_BACKUP_STATUS=$?
+            set -e
+
+            if [ "$CREATE_BACKUP_STATUS" -eq 0 ]; then
+              BACKUP_ID=$(jq -r '.data.id' "$WORK_DIR/create-backup.json")
+            else
+              echo "The backup request had an ambiguous client result; checking by reserved name before stopping."
+              sleep 15
+              oci_fast bv boot-volume-backup list \
+                --compartment-id "$COMPARTMENT_ID" \
+                --display-name "$BACKUP_NAME" \
+                --all \
+                >"$WORK_DIR/backup-recheck.json"
+              mapfile -t BACKUP_IDS < <(jq -r '.data[] | select(.["lifecycle-state"] != "TERMINATED" and .["lifecycle-state"] != "TERMINATING") | .id' "$WORK_DIR/backup-recheck.json")
+              if [ "${#BACKUP_IDS[@]}" -ne 1 ]; then
+                redact_ocids <"$WORK_DIR/create-backup.err" >&2
+                echo "Could not safely identify exactly one backup; rerun this idempotent workflow after inspection."
+                exit 1
+              fi
+              BACKUP_ID=${BACKUP_IDS[0]}
+            fi
+          else
+            BACKUP_ID=${BACKUP_IDS[0]}
+            echo "Reusing the existing backup with the reserved name."
+          fi
+
+          echo "Waiting for the boot volume backup to become AVAILABLE."
+          BACKUP_DEADLINE=$((SECONDS + 90 * 60))
+          while [ "$SECONDS" -lt "$BACKUP_DEADLINE" ]; do
+            oci_fast bv boot-volume-backup get \
+              --boot-volume-backup-id "$BACKUP_ID" \
+              >"$WORK_DIR/backup-state.json"
+            BACKUP_STATE=$(jq -r '.data["lifecycle-state"]' "$WORK_DIR/backup-state.json")
+            echo "Backup state: $BACKUP_STATE"
+            case "$BACKUP_STATE" in
+              AVAILABLE) break ;;
+              FAULTY|TERMINATED|TERMINATING)
+                echo "Backup entered terminal state $BACKUP_STATE."
+                exit 1
+                ;;
+            esac
+            sleep 30
+          done
+          if [ "$BACKUP_STATE" != "AVAILABLE" ]; then
+            echo "Backup did not become AVAILABLE before the safe timeout; rerun to continue polling it."
+            exit 1
+          fi
+
+          BACKUP_SOURCE_ID=$(jq -r '.data["boot-volume-id"] // empty' "$WORK_DIR/backup-state.json")
+          BACKUP_SIZE=$(jq -r '.data["size-in-gbs"] // empty' "$WORK_DIR/backup-state.json")
+          if [ "$BACKUP_SOURCE_ID" != "$SOURCE_BOOT_VOLUME_ID" ] || [ "$BACKUP_SIZE" != "100" ]; then
+            echo "The backup does not match the expected 100 GB retained source."
+            exit 1
+          fi
+
+          if [ "${#TARGET_VOLUME_IDS[@]}" -eq 0 ]; then
+            echo "Restoring one 100 GB Balanced boot volume to $TARGET_AD."
+            set +e
+            oci_fast bv boot-volume create \
+              --availability-domain "$TARGET_AD" \
+              --compartment-id "$COMPARTMENT_ID" \
+              --boot-volume-backup-id "$BACKUP_ID" \
+              --display-name "$TARGET_VOLUME_NAME" \
+              --size-in-gbs 100 \
+              --vpus-per-gb 10 \
+              --freeform-tags '{"free-tier-recovery":"ad1-restored-boot-volume"}' \
+              >"$WORK_DIR/create-volume.json" 2>"$WORK_DIR/create-volume.err"
+            CREATE_VOLUME_STATUS=$?
+            set -e
+
+            if [ "$CREATE_VOLUME_STATUS" -eq 0 ]; then
+              TARGET_VOLUME_ID=$(jq -r '.data.id' "$WORK_DIR/create-volume.json")
+            else
+              echo "The restore request had an ambiguous client result; checking by reserved name before stopping."
+              sleep 15
+              collect_volume_inventory
+              mapfile -t TARGET_VOLUME_IDS < <(jq -rs --arg name "$TARGET_VOLUME_NAME" --arg ad "$TARGET_AD" '
+                .[] | select(.name == $name and .availabilityDomain == $ad) | .id
+              ' "$WORK_DIR/boot-volumes.ndjson")
+              if [ "${#TARGET_VOLUME_IDS[@]}" -ne 1 ]; then
+                redact_ocids <"$WORK_DIR/create-volume.err" >&2
+                echo "Could not safely identify exactly one restored volume; rerun after inspection."
+                exit 1
+              fi
+              TARGET_VOLUME_ID=${TARGET_VOLUME_IDS[0]}
+            fi
+          else
+            TARGET_VOLUME_ID=${TARGET_VOLUME_IDS[0]}
+            echo "Reusing the existing restored volume with the reserved name."
+          fi
+
+          echo "Waiting for the restored boot volume to become AVAILABLE."
+          VOLUME_DEADLINE=$((SECONDS + 60 * 60))
+          while [ "$SECONDS" -lt "$VOLUME_DEADLINE" ]; do
+            oci_fast bv boot-volume get \
+              --boot-volume-id "$TARGET_VOLUME_ID" \
+              >"$WORK_DIR/target-state.json"
+            TARGET_STATE=$(jq -r '.data["lifecycle-state"]' "$WORK_DIR/target-state.json")
+            echo "Restored volume state: $TARGET_STATE"
+            case "$TARGET_STATE" in
+              AVAILABLE) break ;;
+              FAULTY|TERMINATED|TERMINATING)
+                echo "Restored volume entered terminal state $TARGET_STATE."
+                exit 1
+                ;;
+            esac
+            sleep 30
+          done
+          if [ "$TARGET_STATE" != "AVAILABLE" ]; then
+            echo "Restored volume did not become AVAILABLE before the safe timeout; rerun to continue polling it."
+            exit 1
+          fi
+
+          TARGET_SUMMARY=$(jq -c '{
+            name: .data["display-name"],
+            state: .data["lifecycle-state"],
+            availabilityDomain: .data["availability-domain"],
+            sizeGB: .data["size-in-gbs"],
+            vpusPerGB: .data["vpus-per-gb"],
+            sourceType: .data["source-details"].type
+          }' "$WORK_DIR/target-state.json")
+          echo "Restored boot volume: $TARGET_SUMMARY"
+
+          if [ "$(jq -r '.data["display-name"]' "$WORK_DIR/target-state.json")" != "$TARGET_VOLUME_NAME" ] || \
+             [ "$(jq -r '.data["availability-domain"]' "$WORK_DIR/target-state.json")" != "$TARGET_AD" ] || \
+             [ "$(jq -r '.data["size-in-gbs"]' "$WORK_DIR/target-state.json")" != "100" ] || \
+             [ "$(jq -r '.data["vpus-per-gb"]' "$WORK_DIR/target-state.json")" != "10" ]; then
+            echo "The restored volume failed final placement, size, or performance validation."
+            exit 1
+          fi
+
+          collect_volume_inventory
+          FINAL_BOOT_GB=$(jq -sc '[.[].sizeGB // 0] | add // 0' "$WORK_DIR/boot-volumes.ndjson")
+          FINAL_BLOCK_GB=$(jq -sc '[.[].sizeGB // 0] | add // 0' "$WORK_DIR/block-volumes.ndjson")
+          FINAL_VOLUME_GB=$((FINAL_BOOT_GB + FINAL_BLOCK_GB))
+          echo "Final home-region boot + block volume storage: ${FINAL_VOLUME_GB} GB."
+          if [ "$FINAL_VOLUME_GB" -gt 200 ]; then
+            echo "Final storage unexpectedly exceeds the Always Free allotment."
+            exit 1
+          fi
+
+          echo "AD-1 recovery source is ready without modifying the AD-3 retained source."
