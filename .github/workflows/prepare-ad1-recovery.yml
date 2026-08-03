@@ -2,6 +2,12 @@ name: Prepare OCI AD-1 Recovery Boot Volume
 
 on:
   workflow_dispatch:
+    inputs:
+      execute:
+        description: Create the backup and AD-1 restored volume after all checks pass
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -19,6 +25,8 @@ env:
   OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
   OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
   OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+  SUPPRESS_LABEL_WARNING: "True"
+  EXECUTE: ${{ inputs.execute }}
   SOURCE_AD: QNKM:PHX-AD-3
   TARGET_AD: QNKM:PHX-AD-1
   BACKUP_NAME: oci-free-arm-vm-ad1-recovery-backup
@@ -89,15 +97,31 @@ jobs:
             exit 1
           fi
 
-          EXISTING_INSTANCE_COUNT=$(oci_fast compute instance list \
+          oci_fast compute instance list \
             --compartment-id "$COMPARTMENT_ID" \
             --display-name "$INSTANCE_NAME" \
             --all \
-            --query 'length(data[?"lifecycle-state"!=`TERMINATED`])' \
-            --raw-output)
+            >"$WORK_DIR/matching-instances.json"
+          MATCHING_INSTANCE_SUMMARY=$(jq -c '[.data[] | {
+            state: .["lifecycle-state"],
+            availabilityDomain: .["availability-domain"],
+            shape: .shape,
+            ocpus: .["shape-config"].ocpus,
+            memoryGB: .["shape-config"]["memory-in-gbs"],
+            timeCreated: .["time-created"]
+          }]' "$WORK_DIR/matching-instances.json")
+          echo "Matching instances (identifiers omitted): $MATCHING_INSTANCE_SUMMARY"
+
+          EXISTING_INSTANCE_COUNT=$(jq '[.data[] | select(.["lifecycle-state"] != "TERMINATED")] | length' \
+            "$WORK_DIR/matching-instances.json")
           if [ "$EXISTING_INSTANCE_COUNT" != "0" ]; then
-            echo "A non-terminated $INSTANCE_NAME instance already exists; refusing to prepare another launch source."
+            echo "A non-terminated $INSTANCE_NAME instance already exists; refusing all storage writes."
             exit 1
+          fi
+
+          if [ "$EXECUTE" != "true" ]; then
+            echo "Read-only diagnostic mode completed; dispatch with execute=true only after reviewing this output."
+            exit 0
           fi
 
           oci_fast iam availability-domain list \
