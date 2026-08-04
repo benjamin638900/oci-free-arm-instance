@@ -73,6 +73,28 @@ jobs:
             oci --no-retry --connection-timeout 5 --read-timeout 30 "$@"
           }
 
+          oci_list() {
+            local output
+
+            if ! output=$(oci_fast "$@"); then
+              return 1
+            fi
+
+            # OCI CLI renders a successful empty list as no stdout at all.
+            # Normalize that response before jq so an empty list is not
+            # mistaken for a failed query or an existing resource.
+            if [ -z "${output//[[:space:]]/}" ]; then
+              printf '%s\n' '{"data":[]}'
+              return 0
+            fi
+
+            if ! jq -e 'type == "object" and (.data | type == "array")' <<<"$output" >/dev/null; then
+              echo "OCI list returned invalid JSON; refusing to continue." >&2
+              return 1
+            fi
+            printf '%s\n' "$output"
+          }
+
           redact_ocids() {
             sed -E 's/ocid1\.[[:alnum:]._-]+/<redacted-ocid>/g'
           }
@@ -97,7 +119,7 @@ jobs:
             exit 1
           fi
 
-          oci_fast compute instance list \
+          oci_list compute instance list \
             --compartment-id "$COMPARTMENT_ID" \
             --display-name "$INSTANCE_NAME" \
             --all \
@@ -124,7 +146,7 @@ jobs:
             exit 0
           fi
 
-          oci_fast iam availability-domain list \
+          oci_list iam availability-domain list \
             --compartment-id "$OCI_CLI_TENANCY" \
             >"$WORK_DIR/ads.json"
           mapfile -t ADS < <(jq -r '.data[].name' "$WORK_DIR/ads.json")
@@ -134,7 +156,7 @@ jobs:
             : >"$WORK_DIR/block-volumes.ndjson"
 
             for AD in "${ADS[@]}"; do
-              oci_fast bv boot-volume list \
+              oci_list bv boot-volume list \
                 --compartment-id "$COMPARTMENT_ID" \
                 --availability-domain "$AD" \
                 --all \
@@ -147,7 +169,7 @@ jobs:
                     vpusPerGB: .["vpus-per-gb"]
                   }' >>"$WORK_DIR/boot-volumes.ndjson"
 
-              oci_fast bv volume list \
+              oci_list bv volume list \
                 --compartment-id "$COMPARTMENT_ID" \
                 --availability-domain "$AD" \
                 --all \
@@ -175,11 +197,11 @@ jobs:
             exit 1
           fi
 
-          oci_fast bv boot-volume-backup list \
+          oci_list bv boot-volume-backup list \
             --compartment-id "$COMPARTMENT_ID" \
             --all \
             >"$WORK_DIR/boot-backups.json"
-          oci_fast bv backup list \
+          oci_list bv backup list \
             --compartment-id "$COMPARTMENT_ID" \
             --all \
             >"$WORK_DIR/block-backups.json"
@@ -221,7 +243,7 @@ jobs:
             else
               echo "The backup request had an ambiguous client result; checking by reserved name before stopping."
               sleep 15
-              oci_fast bv boot-volume-backup list \
+              oci_list bv boot-volume-backup list \
                 --compartment-id "$COMPARTMENT_ID" \
                 --display-name "$BACKUP_NAME" \
                 --all \
