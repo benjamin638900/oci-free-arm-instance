@@ -15,8 +15,8 @@ concurrency:
 
 env:
   COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+  IMAGE_ID: ${{ secrets.IMAGE_ID }}
   SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
-  BOOT_VOLUME_ID: ${{ secrets.OCI_BOOT_VOLUME_ID }}
   OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
   OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
   OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
@@ -24,13 +24,17 @@ env:
   OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
   OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
   SUPPRESS_LABEL_WARNING: "True"
-  AD_NAME: QNKM:PHX-AD-3
   INSTANCE_NAME: oci-free-arm-vm
+  SHAPE: VM.Standard.A1.Flex
+  REQUEST_OCPUS: "1"
+  REQUEST_MEMORY_GB: "6"
+  REQUEST_BOOT_GB: "50"
+  REQUEST_VPUS_PER_GB: "10"
 
 jobs:
   try-create-vm:
     runs-on: ubuntu-latest
-    timeout-minutes: 70
+    timeout-minutes: 60
     steps:
       - name: Cache OCI CLI
         uses: actions/cache@v5
@@ -59,7 +63,10 @@ jobs:
           region=${OCI_CLI_REGION}
           EOF
 
-      - name: Reuse retained boot volume and create A1 instance
+          printf '%s\n' "${{ secrets.SSH_PUBLIC_KEY }}" > /tmp/ssh_key.pub
+          chmod 600 /tmp/ssh_key.pub
+
+      - name: Create an Always Free A1 instance across Phoenix ADs
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -69,146 +76,258 @@ jobs:
             oci --no-retry --connection-timeout 5 --read-timeout 20 "$@"
           }
 
+          oci_list() {
+            local output
+            if ! output=$(oci_fast "$@"); then
+              return 1
+            fi
+            if [ -z "${output//[[:space:]]/}" ]; then
+              printf '%s\n' '{"data":[]}'
+              return 0
+            fi
+            if ! jq -e 'type == "object" and (.data | type == "array")' <<<"$output" >/dev/null; then
+              echo "OCI list returned invalid JSON; refusing to continue." >&2
+              return 1
+            fi
+            printf '%s\n' "$output"
+          }
+
           disable_workflow() {
             gh workflow disable create-vm.yml --repo "$GITHUB_REPOSITORY" || true
           }
 
-          queue_next_run() {
-            echo "Queueing the next retry run instead of waiting for GitHub's delayed schedule."
-            gh workflow run create-vm.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" || true
-          }
-
-          find_existing_instance() {
-            local output
-
-            if ! output=$(oci_fast compute instance list \
+          existing_instance() {
+            local output instance
+            if ! output=$(oci_list compute instance list \
               --compartment-id "$COMPARTMENT_ID" \
               --display-name "$INSTANCE_NAME" \
-              --all \
-              --query 'data[?"lifecycle-state"!=`TERMINATED`].{id:id,state:"lifecycle-state"} | [0]' \
-              2>&1); then
-              echo "$output" >&2
+              --all); then
+              echo "Could not safely check for an existing instance." >&2
+              return 2
+            fi
+            instance=$(jq -c '[.data[] | select(.["lifecycle-state"] != "TERMINATED")] | first // empty' <<<"$output")
+            if [ -z "$instance" ]; then
               return 1
             fi
-
-            printf '%s' "$output"
+            printf '%s\n' "$instance"
           }
 
           handle_existing_instance() {
-            local existing_info existing_id existing_state
-
-            if ! existing_info=$(find_existing_instance); then
-              echo "Could not check for an existing instance; skipping this launch cycle."
-              return 2
-            fi
-
-            existing_id=$(jq -r '.id // empty' <<<"$existing_info")
-            if [ -z "$existing_id" ]; then
+            local instance id state status
+            if instance=$(existing_instance); then
+              :
+            else
+              status=$?
+              if [ "$status" -eq 2 ]; then
+                return 2
+              fi
               return 1
             fi
-
-            existing_state=$(jq -r '.state' <<<"$existing_info")
-            echo "Instance already exists: $existing_id ($existing_state)."
-            if [ "$existing_state" = "RUNNING" ] || [ "$existing_state" = "STOPPED" ]; then
-              disable_workflow
-            fi
+            id=$(jq -r '.id' <<<"$instance")
+            state=$(jq -r '.["lifecycle-state"]' <<<"$instance")
+            echo "A non-terminated instance already exists (state=$state)."
+            case "$state" in
+              RUNNING|STOPPED)
+                echo "Target instance is ready; disabling future retries."
+                disable_workflow
+                ;;
+              *)
+                echo "Target instance is still transitioning; a later run will recheck it."
+                ;;
+            esac
+            printf '%s' "$id" >/tmp/existing-instance-id
             return 0
           }
+
+          if [ "$OCI_CLI_REGION" != "us-phoenix-1" ]; then
+            echo "Refusing to create compute outside the Always Free home region us-phoenix-1."
+            exit 1
+          fi
+
+          for value in "$COMPARTMENT_ID" "$IMAGE_ID" "$SUBNET_ID" "$OCI_CLI_TENANCY"; do
+            if [ -z "$value" ]; then
+              echo "A required OCI identifier is missing."
+              exit 1
+            fi
+          done
+          if [ ! -s /tmp/ssh_key.pub ]; then
+            echo "The SSH public key is missing."
+            exit 1
+          fi
+
+          WORK_DIR=$(mktemp -d)
+          trap 'rm -rf "$WORK_DIR"' EXIT
+
+          SUBNET_INFO=$(oci_fast network subnet get --subnet-id "$SUBNET_ID")
+          SUBNET_AD=$(jq -r '.data["availability-domain"] // empty' <<<"$SUBNET_INFO")
+          SUBNET_STATE=$(jq -r '.data["lifecycle-state"] // empty' <<<"$SUBNET_INFO")
+          if [ -n "$SUBNET_AD" ] || [ "$SUBNET_STATE" != "AVAILABLE" ]; then
+            echo "The configured subnet is not an AVAILABLE regional subnet; refusing cross-AD launches."
+            exit 1
+          fi
+          echo "Regional subnet gate passed."
+
+          IMAGE_INFO=$(oci_fast compute image get --image-id "$IMAGE_ID")
+          IMAGE_STATE=$(jq -r '.data["lifecycle-state"] // empty' <<<"$IMAGE_INFO")
+          IMAGE_OS=$(jq -r '.data["operating-system"] // empty' <<<"$IMAGE_INFO")
+          if [ "$IMAGE_STATE" != "AVAILABLE" ] || [ -z "$IMAGE_OS" ]; then
+            echo "The configured platform image is not AVAILABLE; refusing to launch."
+            exit 1
+          fi
+          echo "Image gate passed (OS=$IMAGE_OS)."
+
+          oci_list iam availability-domain list \
+            --compartment-id "$OCI_CLI_TENANCY" \
+            >"$WORK_DIR/ads.json"
+          mapfile -t ADS < <(jq -r '.data[].name' "$WORK_DIR/ads.json" | sort)
+          if [ "${#ADS[@]}" -ne 3 ]; then
+            echo "Expected exactly three Phoenix availability domains; refusing unexpected placement."
+            exit 1
+          fi
+          for AD in "${ADS[@]}"; do
+            case "$AD" in
+              *:PHX-AD-1|*:PHX-AD-2|*:PHX-AD-3) ;;
+              *) echo "Unexpected availability domain; refusing to continue."; exit 1 ;;
+            esac
+          done
+
+          : >"$WORK_DIR/boot-volumes.ndjson"
+          : >"$WORK_DIR/block-volumes.ndjson"
+          for AD in "${ADS[@]}"; do
+            oci_list bv boot-volume list \
+              --compartment-id "$COMPARTMENT_ID" \
+              --availability-domain "$AD" \
+              --all \
+              | jq -c '.data[] | select(.["lifecycle-state"] != "TERMINATED" and .["lifecycle-state"] != "TERMINATING") | {sizeGB: .["size-in-gbs"]}' \
+              >>"$WORK_DIR/boot-volumes.ndjson"
+            oci_list bv volume list \
+              --compartment-id "$COMPARTMENT_ID" \
+              --availability-domain "$AD" \
+              --all \
+              | jq -c '.data[] | select(.["lifecycle-state"] != "TERMINATED" and .["lifecycle-state"] != "TERMINATING") | {sizeGB: .["size-in-gbs"]}' \
+              >>"$WORK_DIR/block-volumes.ndjson"
+          done
+          CURRENT_BOOT_GB=$(jq -sc '[.[].sizeGB // 0] | add // 0' "$WORK_DIR/boot-volumes.ndjson")
+          CURRENT_BLOCK_GB=$(jq -sc '[.[].sizeGB // 0] | add // 0' "$WORK_DIR/block-volumes.ndjson")
+          PROJECTED_STORAGE_GB=$((CURRENT_BOOT_GB + CURRENT_BLOCK_GB + REQUEST_BOOT_GB))
+          echo "Projected boot + block storage after launch: ${PROJECTED_STORAGE_GB} GB."
+          if [ "$PROJECTED_STORAGE_GB" -gt 200 ]; then
+            echo "Launch would exceed the 200 GB Always Free storage allowance."
+            exit 1
+          fi
+
+          oci_list compute instance list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --all \
+            >"$WORK_DIR/instances.json"
+          CURRENT_A1_OCPUS=$(jq '[.data[] | select(.["lifecycle-state"] != "TERMINATED" and .shape == "VM.Standard.A1.Flex") | .["shape-config"].ocpus // 0] | add // 0' "$WORK_DIR/instances.json")
+          CURRENT_A1_MEMORY=$(jq '[.data[] | select(.["lifecycle-state"] != "TERMINATED" and .shape == "VM.Standard.A1.Flex") | .["shape-config"]["memory-in-gbs"] // 0] | add // 0' "$WORK_DIR/instances.json")
+          if ! jq -ne --argjson ocpus "$CURRENT_A1_OCPUS" --argjson memory "$CURRENT_A1_MEMORY" --argjson requestOcpus "$REQUEST_OCPUS" --argjson requestMemory "$REQUEST_MEMORY_GB" \
+            '($ocpus + $requestOcpus <= 2) and ($memory + $requestMemory <= 12)' >/dev/null; then
+            echo "Launch would exceed the configured Always Free A1 guardrail (2 OCPUs/12 GB)."
+            exit 1
+          fi
+          echo "A1 compute gate passed."
 
           if handle_existing_instance; then
             exit 0
           else
             EXISTING_STATUS=$?
             if [ "$EXISTING_STATUS" -eq 2 ]; then
-              echo "Cannot safely launch without a successful duplicate check."
+              echo "Cannot launch without a successful duplicate check."
               exit 1
             fi
           fi
 
-          BOOT_INFO=$(oci_fast bv boot-volume get \
-            --boot-volume-id "$BOOT_VOLUME_ID" \
-            --query 'data.{state:"lifecycle-state",ad:"availability-domain",sizeGB:"size-in-gbs"}')
-          echo "Retained boot volume: $BOOT_INFO"
+          for AD in "${ADS[@]}"; do
+            SHAPES=$(oci_list compute shape list \
+              --compartment-id "$COMPARTMENT_ID" \
+              --availability-domain "$AD" \
+              --image-id "$IMAGE_ID" \
+              --all)
+            if ! jq -e --arg shape "$SHAPE" '.data[] | select(.shape == $shape)' <<<"$SHAPES" >/dev/null; then
+              echo "The configured image is not compatible with $SHAPE in $AD."
+              exit 1
+            fi
+          done
+          echo "Image/shape compatibility gate passed for all Phoenix ADs."
 
-          BOOT_STATE=$(echo "$BOOT_INFO" | jq -r '.state')
-          BOOT_AD=$(echo "$BOOT_INFO" | jq -r '.ad')
-          BOOT_SIZE=$(echo "$BOOT_INFO" | jq -r '.sizeGB')
-
-          if [ "$BOOT_STATE" != "AVAILABLE" ] || [ "$BOOT_AD" != "$AD_NAME" ] || [ "$BOOT_SIZE" != "100" ]; then
-            echo "Boot volume must be AVAILABLE, 100 GB, and in $AD_NAME."
-            exit 1
-          fi
-
-          END_TIME=$((SECONDS + 60 * 60))
+          END_TIME=$((SECONDS + 55 * 60))
           ATTEMPT=0
-
           while [ "$SECONDS" -lt "$END_TIME" ]; do
             ATTEMPT=$((ATTEMPT + 1))
-            echo "Capacity attempt $ATTEMPT in $AD_NAME"
-
-            if handle_existing_instance; then
-              exit 0
-            else
-              EXISTING_STATUS=$?
-              if [ "$EXISTING_STATUS" -eq 2 ]; then
-                sleep $((10 + RANDOM % 11))
-                continue
-              fi
-            fi
-
-            set +e
-            OCI_OUTPUT=$(oci_fast compute instance launch \
-              --compartment-id "$COMPARTMENT_ID" \
-              --availability-domain "$AD_NAME" \
-              --shape "VM.Standard.A1.Flex" \
-              --shape-config '{"ocpus":2,"memoryInGBs":12}' \
-              --subnet-id "$SUBNET_ID" \
-              --source-details "{\"sourceType\":\"bootVolume\",\"bootVolumeId\":\"${BOOT_VOLUME_ID}\"}" \
-              --assign-public-ip true \
-              --display-name "$INSTANCE_NAME" \
-              --freeform-tags '{"free-tier-recovery":"retained-boot-volume"}' \
-              --query 'data.{id:id,state:"lifecycle-state",shape:shape,ocpus:"shape-config".ocpus,memoryGB:"shape-config"."memory-in-gbs"}' \
-              2>&1)
-            EXIT_CODE=$?
-            set -e
-
-            echo "$OCI_OUTPUT"
-            if [ "$EXIT_CODE" -ne 0 ]; then
-              if grep -Eqi 'Out of host capacity|OUT_OF_CAPACITY' <<<"$OCI_OUTPUT"; then
-                echo "Capacity unavailable on attempt $ATTEMPT."
-              elif grep -Eqi 'timed out|timeout|TooManyRequests|Too many requests|429|InternalError|InternalServerError|BadGateway|ServiceUnavailable|GatewayTimeout|status[" ]*:?[[:space:]]*5[0-9][0-9]' <<<"$OCI_OUTPUT"; then
-                echo "OCI returned a temporary service or network error on attempt $ATTEMPT."
+            for AD in "${ADS[@]}"; do
+              if handle_existing_instance; then
+                exit 0
               else
-                echo "OCI returned a non-retryable error; stopping."
+                EXISTING_STATUS=$?
+                if [ "$EXISTING_STATUS" -eq 2 ]; then
+                  echo "Duplicate check failed; waiting before the next pool attempt."
+                  sleep $((15 + RANDOM % 16))
+                  continue 2
+                fi
+              fi
+
+              echo "Capacity attempt $ATTEMPT in ${AD##*:}."
+              set +e
+              OCI_OUTPUT=$(oci_fast compute instance launch \
+                --compartment-id "$COMPARTMENT_ID" \
+                --availability-domain "$AD" \
+                --shape "$SHAPE" \
+                --shape-config "{\"ocpus\":${REQUEST_OCPUS},\"memoryInGBs\":${REQUEST_MEMORY_GB}}" \
+                --subnet-id "$SUBNET_ID" \
+                --source-details "{\"sourceType\":\"image\",\"imageId\":\"${IMAGE_ID}\",\"bootVolumeSizeInGBs\":${REQUEST_BOOT_GB},\"bootVolumeVpusPerGB\":${REQUEST_VPUS_PER_GB}}" \
+                --ssh-authorized-keys-file /tmp/ssh_key.pub \
+                --assign-public-ip true \
+                --display-name "$INSTANCE_NAME" \
+                --freeform-tags '{"always-free":"phoenix-multi-ad"}' \
+                --query 'data.{id:id,state:"lifecycle-state"}' \
+                2>&1)
+              EXIT_CODE=$?
+              set -e
+
+              if [ "$EXIT_CODE" -ne 0 ]; then
+                if grep -Eqi 'Out of host capacity|OUT_OF_CAPACITY' <<<"$OCI_OUTPUT"; then
+                  echo "Capacity unavailable in ${AD##*:}."
+                  continue
+                fi
+                if grep -Eqi 'timed out|timeout|TooManyRequests|Too many requests|429|InternalError|InternalServerError|BadGateway|ServiceUnavailable|GatewayTimeout|status[" ]*:?[[:space:]]*5[0-9][0-9]' <<<"$OCI_OUTPUT"; then
+                  echo "OCI returned a temporary service or network error in ${AD##*:}."
+                  continue
+                fi
+                echo "$OCI_OUTPUT" | sed -E 's/ocid1\.[[:alnum:]._-]+/<redacted-ocid>/g' >&2
+                echo "OCI returned a non-retryable launch error; stopping."
                 exit 1
               fi
 
-              sleep $((15 + RANDOM % 16))
-              continue
-            fi
+              INSTANCE_ID=$(jq -r '.id // empty' <<<"$OCI_OUTPUT")
+              if [ -z "$INSTANCE_ID" ]; then
+                echo "Launch returned success without an instance ID; rechecking by name before stopping."
+                sleep 10
+                if handle_existing_instance; then
+                  INSTANCE_ID=$(cat /tmp/existing-instance-id)
+                else
+                  exit 1
+                fi
+              fi
+              echo "Instance creation accepted in ${AD##*:}."
 
-            INSTANCE_ID=$(jq -r '.id // empty' <<<"$OCI_OUTPUT")
-            if [ -z "$INSTANCE_ID" ]; then
-              echo "OCI returned success without an instance ID; stopping."
+              if oci compute instance get \
+                --instance-id "$INSTANCE_ID" \
+                --wait-for-state RUNNING \
+                --max-wait-seconds 900 \
+                >"$WORK_DIR/instance-running.json"; then
+                STATE=$(jq -r '.data["lifecycle-state"]' "$WORK_DIR/instance-running.json")
+                echo "Instance reached $STATE; disabling future retries."
+                disable_workflow
+                exit 0
+              fi
+
+              echo "Instance was accepted and will be rechecked by the next run."
               exit 1
-            fi
-            echo "Instance creation accepted: $INSTANCE_ID"
-
-            if oci compute instance get \
-              --instance-id "$INSTANCE_ID" \
-              --wait-for-state RUNNING \
-              --max-wait-seconds 900 \
-              >/tmp/instance-running.json; then
-              cat /tmp/instance-running.json
-              echo "Instance is RUNNING. Disabling future retries."
-              disable_workflow
-              exit 0
-            fi
-
-            echo "Instance was accepted but is not RUNNING yet. A later run will recheck it without creating a duplicate."
-            exit 1
+            done
+            sleep $((15 + RANDOM % 16))
           done
 
-          echo "Capacity remained unavailable after $ATTEMPT attempts in this one-hour run."
-          queue_next_run
+          echo "Phoenix capacity remained unavailable after $ATTEMPT pool attempts; the schedule will retry."
           exit 1
