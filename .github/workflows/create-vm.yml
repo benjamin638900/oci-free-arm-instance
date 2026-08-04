@@ -34,7 +34,7 @@ env:
 jobs:
   try-create-vm:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - name: Cache OCI CLI
         uses: actions/cache@v5
@@ -96,8 +96,16 @@ jobs:
             gh workflow disable create-vm.yml --repo "$GITHUB_REPOSITORY" || true
           }
 
+          queue_next_run() {
+            echo "Queueing the next retry run instead of relying only on GitHub's delayed schedule."
+            gh workflow run create-vm.yml \
+              --repo "$GITHUB_REPOSITORY" \
+              --ref "$GITHUB_REF_NAME" \
+              || echo "Immediate dispatch failed; the five-minute schedule remains the fallback."
+          }
+
           existing_instance() {
-            local output instance
+            local output instance count
             if ! output=$(oci_list compute instance list \
               --compartment-id "$COMPARTMENT_ID" \
               --display-name "$INSTANCE_NAME" \
@@ -105,6 +113,14 @@ jobs:
               echo "Could not safely check for an existing instance." >&2
               return 2
             fi
+
+            count=$(jq '[.data[] | select(.["lifecycle-state"] != "TERMINATED")] | length' <<<"$output")
+            if [ "$count" -gt 1 ]; then
+              echo "Multiple non-terminated target instances exist; disabling retries for manual inspection." >&2
+              disable_workflow
+              return 2
+            fi
+
             instance=$(jq -c '[.data[] | select(.["lifecycle-state"] != "TERMINATED")] | first // empty' <<<"$output")
             if [ -z "$instance" ]; then
               return 1
@@ -123,8 +139,15 @@ jobs:
               fi
               return 1
             fi
-            id=$(jq -r '.id' <<<"$instance")
-            state=$(jq -r '.["lifecycle-state"]' <<<"$instance")
+
+            id=$(jq -r '.id // empty' <<<"$instance")
+            state=$(jq -r '.["lifecycle-state"] // empty' <<<"$instance")
+            if [ -z "$id" ] || [ -z "$state" ]; then
+              echo "Existing instance data is incomplete; refusing another launch." >&2
+              return 2
+            fi
+
+            printf '%s' "$id" >/tmp/existing-instance-id
             echo "A non-terminated instance already exists (state=$state)."
             case "$state" in
               RUNNING|STOPPED)
@@ -132,11 +155,39 @@ jobs:
                 disable_workflow
                 ;;
               *)
-                echo "Target instance is still transitioning; a later run will recheck it."
+                echo "Target instance is still transitioning; queueing a later recheck without launching a duplicate."
+                queue_next_run
                 ;;
             esac
-            printf '%s' "$id" >/tmp/existing-instance-id
             return 0
+          }
+
+          reconcile_ambiguous_launch() {
+            local check status consecutive_absent=0
+
+            echo "The launch result may be ambiguous; checking for an accepted instance for 60 seconds."
+            for check in $(seq 1 12); do
+              sleep 5
+              if handle_existing_instance; then
+                return 0
+              else
+                status=$?
+                if [ "$status" -eq 1 ]; then
+                  consecutive_absent=$((consecutive_absent + 1))
+                else
+                  consecutive_absent=0
+                  echo "Duplicate check $check/12 failed while reconciling the launch result."
+                fi
+              fi
+            done
+
+            if [ "$consecutive_absent" -ge 3 ]; then
+              echo "No instance appeared during the ambiguity window."
+              return 1
+            fi
+
+            echo "Could not obtain enough consecutive duplicate checks to classify the launch result safely."
+            return 2
           }
 
           if [ "$OCI_CLI_REGION" != "us-phoenix-1" ]; then
@@ -157,6 +208,16 @@ jobs:
 
           WORK_DIR=$(mktemp -d)
           trap 'rm -rf "$WORK_DIR"' EXIT
+
+          if handle_existing_instance; then
+            exit 0
+          else
+            EXISTING_STATUS=$?
+            if [ "$EXISTING_STATUS" -eq 2 ]; then
+              echo "Cannot continue without a successful duplicate check."
+              exit 1
+            fi
+          fi
 
           SUBNET_INFO=$(oci_fast network subnet get --subnet-id "$SUBNET_ID")
           SUBNET_AD=$(jq -r '.data["availability-domain"] // empty' <<<"$SUBNET_INFO")
@@ -211,8 +272,8 @@ jobs:
           CURRENT_BLOCK_GB=$(jq -sc '[.[].sizeGB // 0] | add // 0' "$WORK_DIR/block-volumes.ndjson")
           PROJECTED_STORAGE_GB=$((CURRENT_BOOT_GB + CURRENT_BLOCK_GB + REQUEST_BOOT_GB))
           echo "Projected boot + block storage after launch: ${PROJECTED_STORAGE_GB} GB."
-          if [ "$PROJECTED_STORAGE_GB" -gt 200 ]; then
-            echo "Launch would exceed the 200 GB Always Free storage allowance."
+          if [ "$PROJECTED_STORAGE_GB" -gt 150 ]; then
+            echo "Launch would exceed the target envelope of one retained 100 GB disk plus one 50 GB instance disk."
             exit 1
           fi
 
@@ -222,22 +283,12 @@ jobs:
             >"$WORK_DIR/instances.json"
           CURRENT_A1_OCPUS=$(jq '[.data[] | select(.["lifecycle-state"] != "TERMINATED" and .shape == "VM.Standard.A1.Flex") | .["shape-config"].ocpus // 0] | add // 0' "$WORK_DIR/instances.json")
           CURRENT_A1_MEMORY=$(jq '[.data[] | select(.["lifecycle-state"] != "TERMINATED" and .shape == "VM.Standard.A1.Flex") | .["shape-config"]["memory-in-gbs"] // 0] | add // 0' "$WORK_DIR/instances.json")
-          if ! jq -ne --argjson ocpus "$CURRENT_A1_OCPUS" --argjson memory "$CURRENT_A1_MEMORY" --argjson requestOcpus "$REQUEST_OCPUS" --argjson requestMemory "$REQUEST_MEMORY_GB" \
-            '($ocpus + $requestOcpus <= 2) and ($memory + $requestMemory <= 12)' >/dev/null; then
-            echo "Launch would exceed the configured Always Free A1 guardrail (2 OCPUs/12 GB)."
+          if ! jq -ne --argjson ocpus "$CURRENT_A1_OCPUS" --argjson memory "$CURRENT_A1_MEMORY" \
+            '($ocpus == 0) and ($memory == 0)' >/dev/null; then
+            echo "Existing A1 usage already consumes the single-instance target envelope; refusing another launch."
             exit 1
           fi
-          echo "A1 compute gate passed."
-
-          if handle_existing_instance; then
-            exit 0
-          else
-            EXISTING_STATUS=$?
-            if [ "$EXISTING_STATUS" -eq 2 ]; then
-              echo "Cannot launch without a successful duplicate check."
-              exit 1
-            fi
-          fi
+          echo "A1 compute gate passed for one 1 OCPU/6 GB target instance."
 
           for AD in "${ADS[@]}"; do
             SHAPES=$(oci_list compute shape list \
@@ -291,9 +342,24 @@ jobs:
                   echo "Capacity unavailable in ${AD##*:}."
                   continue
                 fi
-                if grep -Eqi 'timed out|timeout|TooManyRequests|Too many requests|429|InternalError|InternalServerError|BadGateway|ServiceUnavailable|GatewayTimeout|status[" ]*:?[[:space:]]*5[0-9][0-9]' <<<"$OCI_OUTPUT"; then
-                  echo "OCI returned a temporary service or network error in ${AD##*:}."
+                if grep -Eqi 'TooManyRequests|Too many requests|429' <<<"$OCI_OUTPUT"; then
+                  echo "OCI rate-limited the request in ${AD##*:}; waiting before continuing."
+                  sleep $((15 + RANDOM % 16))
                   continue
+                fi
+                if grep -Eqi 'timed out|timeout|InternalError|InternalServerError|BadGateway|ServiceUnavailable|GatewayTimeout|status[" ]*:?[[:space:]]*5[0-9][0-9]' <<<"$OCI_OUTPUT"; then
+                  echo "OCI returned a potentially ambiguous service or network error in ${AD##*:}."
+                  if reconcile_ambiguous_launch; then
+                    exit 0
+                  fi
+                  RECONCILE_STATUS=$?
+                  if [ "$RECONCILE_STATUS" -eq 2 ]; then
+                    echo "The duplicate checks were inconclusive; stopping rather than risking another instance."
+                  else
+                    echo "No accepted instance was found; ending this run before trying another AD."
+                  fi
+                  queue_next_run
+                  exit 1
                 fi
                 echo "$OCI_OUTPUT" | sed -E 's/ocid1\.[[:alnum:]._-]+/<redacted-ocid>/g' >&2
                 echo "OCI returned a non-retryable launch error; stopping."
@@ -302,13 +368,13 @@ jobs:
 
               INSTANCE_ID=$(jq -r '.id // empty' <<<"$OCI_OUTPUT")
               if [ -z "$INSTANCE_ID" ]; then
-                echo "Launch returned success without an instance ID; rechecking by name before stopping."
-                sleep 10
-                if handle_existing_instance; then
-                  INSTANCE_ID=$(cat /tmp/existing-instance-id)
-                else
-                  exit 1
+                echo "Launch returned success without an instance ID; reconciling by name before stopping."
+                if reconcile_ambiguous_launch; then
+                  exit 0
                 fi
+                echo "Could not safely identify an accepted instance."
+                queue_next_run
+                exit 1
               fi
               echo "Instance creation accepted in ${AD##*:}."
 
@@ -324,10 +390,12 @@ jobs:
               fi
 
               echo "Instance was accepted and will be rechecked by the next run."
+              queue_next_run
               exit 1
             done
             sleep $((15 + RANDOM % 16))
           done
 
-          echo "Phoenix capacity remained unavailable after $ATTEMPT pool attempts; the schedule will retry."
+          echo "Phoenix capacity remained unavailable after $ATTEMPT pool attempts."
+          queue_next_run
           exit 1
