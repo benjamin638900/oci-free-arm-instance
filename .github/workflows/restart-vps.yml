@@ -1,0 +1,141 @@
+name: Soft Restart OCI VPS
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type SOFTRESET to restart the target VPS
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oci-vps-soft-restart
+  cancel-in-progress: false
+
+env:
+  COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+  OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+  OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+  OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+  OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+  OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+  OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+  CONFIRM_ACTION: ${{ inputs.confirm }}
+  INSTANCE_NAME: oci-free-arm-vm
+  EXPECTED_SHAPE: VM.Standard.A1.Flex
+
+jobs:
+  soft-restart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Cache OCI CLI
+        uses: actions/cache@v5
+        with:
+          path: ~/.local
+          key: ${{ runner.os }}-pip-oci-cli-v1
+
+      - name: Add OCI CLI to PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install OCI CLI
+        run: pip install --user oci-cli
+
+      - name: Configure OCI CLI
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "${OCI_CLI_KEY_CONTENT}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${OCI_CLI_USER}
+          tenancy=${OCI_CLI_TENANCY}
+          fingerprint=${OCI_CLI_FINGERPRINT}
+          key_file=~/.oci/oci_api_key.pem
+          region=${OCI_CLI_REGION}
+          EOF
+
+      - name: Preflight and gracefully restart the unique target
+        run: |
+          set -euo pipefail
+
+          if [ "$CONFIRM_ACTION" != "SOFTRESET" ]; then
+            echo "The explicit SOFTRESET confirmation is missing."
+            exit 1
+          fi
+          if [ "$OCI_CLI_REGION" != "us-phoenix-1" ]; then
+            echo "Refusing to restart compute outside us-phoenix-1."
+            exit 1
+          fi
+          if [ -z "$COMPARTMENT_ID" ]; then
+            echo "The OCI compartment is missing."
+            exit 1
+          fi
+
+          INSTANCES=$(oci compute instance list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --display-name "$INSTANCE_NAME" \
+            --all)
+          INSTANCE_COUNT=$(jq '[.data[] | select(.["lifecycle-state"] != "TERMINATED")] | length' <<<"$INSTANCES")
+          if [ "$INSTANCE_COUNT" != "1" ]; then
+            echo "Expected exactly one non-terminated target instance; refusing to guess."
+            exit 1
+          fi
+
+          INSTANCE_ID=$(jq -r '.data[] | select(.["lifecycle-state"] != "TERMINATED") | .id' <<<"$INSTANCES")
+          LISTED_STATE=$(jq -r '.data[] | select(.["lifecycle-state"] != "TERMINATED") | .["lifecycle-state"]' <<<"$INSTANCES")
+          LISTED_SHAPE=$(jq -r '.data[] | select(.["lifecycle-state"] != "TERMINATED") | .shape' <<<"$INSTANCES")
+          if [ -z "$INSTANCE_ID" ] || [ "$LISTED_STATE" != "RUNNING" ] || [ "$LISTED_SHAPE" != "$EXPECTED_SHAPE" ]; then
+            echo "The unique target is not the expected RUNNING A1 instance; refusing to restart."
+            exit 1
+          fi
+
+          INSTANCE=$(oci compute instance get --instance-id "$INSTANCE_ID")
+          ETAG=$(jq -r '.etag // empty' <<<"$INSTANCE")
+          CURRENT_STATE=$(jq -r '.data["lifecycle-state"] // empty' <<<"$INSTANCE")
+          CURRENT_NAME=$(jq -r '.data["display-name"] // empty' <<<"$INSTANCE")
+          CURRENT_SHAPE=$(jq -r '.data.shape // empty' <<<"$INSTANCE")
+          if [ -z "$ETAG" ] || [ "$CURRENT_STATE" != "RUNNING" ] || \
+             [ "$CURRENT_NAME" != "$INSTANCE_NAME" ] || [ "$CURRENT_SHAPE" != "$EXPECTED_SHAPE" ]; then
+            echo "The fresh instance preflight changed or has no ETag; refusing to restart."
+            exit 1
+          fi
+
+          echo "PRE_RESTART_STATE=$CURRENT_STATE"
+          echo "RESTART_ACTION=SOFTRESET"
+
+          set +e
+          ACTION_OUTPUT=$(oci compute instance action \
+            --instance-id "$INSTANCE_ID" \
+            --action SOFTRESET \
+            --if-match "$ETAG" \
+            --wait-for-state RUNNING \
+            --wait-interval-seconds 15 \
+            --max-wait-seconds 1800 \
+            2>&1)
+          ACTION_STATUS=$?
+          set -e
+          if [ "$ACTION_STATUS" -ne 0 ]; then
+            unset ACTION_OUTPUT
+            echo "SOFT_RESTART_EXIT_STATUS=$ACTION_STATUS" >&2
+            echo "The graceful restart request failed."
+            exit "$ACTION_STATUS"
+          fi
+          unset ACTION_OUTPUT
+
+          POST_INSTANCE=$(oci compute instance get --instance-id "$INSTANCE_ID")
+          POST_STATE=$(jq -r '.data["lifecycle-state"] // empty' <<<"$POST_INSTANCE")
+          POST_NAME=$(jq -r '.data["display-name"] // empty' <<<"$POST_INSTANCE")
+          POST_SHAPE=$(jq -r '.data.shape // empty' <<<"$POST_INSTANCE")
+          if [ "$POST_STATE" != "RUNNING" ] || [ "$POST_NAME" != "$INSTANCE_NAME" ] || \
+             [ "$POST_SHAPE" != "$EXPECTED_SHAPE" ]; then
+            echo "The target did not return as the expected RUNNING A1 instance."
+            exit 1
+          fi
+
+          echo "POST_RESTART_STATE=$POST_STATE"
+          echo "SOFT_RESTART_VERIFIED=true"
