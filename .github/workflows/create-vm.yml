@@ -312,9 +312,19 @@ jobs:
             >"$WORK_DIR/instances.json"
           CURRENT_A1_OCPUS=$(jq '[.data[] | select(.["lifecycle-state"] != "TERMINATED" and .shape == "VM.Standard.A1.Flex") | .["shape-config"].ocpus // 0] | add // 0' "$WORK_DIR/instances.json")
           CURRENT_A1_MEMORY=$(jq '[.data[] | select(.["lifecycle-state"] != "TERMINATED" and .shape == "VM.Standard.A1.Flex") | .["shape-config"]["memory-in-gbs"] // 0] | add // 0' "$WORK_DIR/instances.json")
-          OTHER_COMPUTE_COUNT=$(jq '[.data[] | select(.["lifecycle-state"] != "TERMINATED" and .shape != "VM.Standard.A1.Flex")] | length' "$WORK_DIR/instances.json")
+          MICRO_COUNT=$(jq '[.data[] | select(.["lifecycle-state"] != "TERMINATED" and .shape == "VM.Standard.E2.1.Micro")] | length' "$WORK_DIR/instances.json")
+          OTHER_COMPUTE_COUNT=$(jq '[.data[] | select(
+            .["lifecycle-state"] != "TERMINATED" and
+            .shape != "VM.Standard.A1.Flex" and
+            .shape != "VM.Standard.E2.1.Micro")
+          ] | length' "$WORK_DIR/instances.json")
           if [ "$OTHER_COMPUTE_COUNT" != "0" ]; then
-            echo "A non-A1 compute resource exists outside the zero-cost allowlist; refusing another launch."
+            echo "A compute resource exists outside the A1/E2.1.Micro zero-cost allowlist; refusing another launch."
+            disable_workflow
+            exit 1
+          fi
+          if [ "$MICRO_COUNT" -gt 2 ]; then
+            echo "More than two E2.1.Micro instances exist; refusing another launch."
             disable_workflow
             exit 1
           fi
@@ -329,7 +339,7 @@ jobs:
             echo "The launch would exceed the verified 2 OCPU / 12 GB A1 allowance; refusing another launch."
             exit 1
           fi
-          echo "A1 compute gate passed for one 2 OCPU / 12 GB target instance."
+          echo "Compute allowlist passed (E2.1.Micro count=$MICRO_COUNT); A1 gate passed for one 2 OCPU / 12 GB target instance."
 
           for AD in "${ADS[@]}"; do
             SHAPES=$(oci_list compute shape list \

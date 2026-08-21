@@ -4,7 +4,7 @@
 
 This repository contains GitHub Actions workflows that provision and guard an "Always Free" `VM.Standard.A1.Flex` (Arm) compute instance in one OCI tenancy.
 
-The checked-in safety envelope is deliberately conservative and follows the allowance currently shown in this tenancy's OCI Console: **2 OCPUs, 12 GB memory, and no more than 150 GB of combined boot and block storage in the Phoenix home region**. The creator prefers the retained 100 GB PHX-AD-3 boot volume, and only creates a 50 GB Balanced boot volume when another Phoenix availability domain is used.
+The checked-in safety envelope is deliberately conservative and follows the allowance currently shown in this tenancy's OCI Console: **2 A1 OCPUs, 12 GB A1 memory, up to two Always Free `VM.Standard.E2.1.Micro` instances, and no more than 150 GB of combined boot and block storage in the Phoenix home region**. The creator prefers the retained 100 GB PHX-AD-3 boot volume, and only creates a 50 GB Balanced boot volume when another Phoenix availability domain is used.
 
 `OCI Zero Cost Guard` runs hourly. It disables the creator and stops the named A1 instance if compute or storage leaves the allowlist. If OCI's delayed Usage API reports a non-zero cost, it disables the creator and only stops the named A1 when that billed resource ID matches the target instance. Billing data is not real time, so the creation-time allowlist and preflight checks are the primary protection.
 

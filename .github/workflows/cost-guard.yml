@@ -108,18 +108,33 @@ jobs:
             --compartment-id "$COMPARTMENT_ID" \
             --all >"$WORK_DIR/instances.json"
 
-          OTHER_COMPUTE_COUNT=$(jq '[.data[] |
-            select(.["lifecycle-state"] != "TERMINATED" and .shape != "VM.Standard.A1.Flex")] | length' \
-            "$WORK_DIR/instances.json")
           A1_OCPUS=$(jq '[.data[] |
             select(.["lifecycle-state"] != "TERMINATED" and .shape == "VM.Standard.A1.Flex") |
             .["shape-config"].ocpus // 0] | add // 0' "$WORK_DIR/instances.json")
           A1_MEMORY=$(jq '[.data[] |
             select(.["lifecycle-state"] != "TERMINATED" and .shape == "VM.Standard.A1.Flex") |
             .["shape-config"]["memory-in-gbs"] // 0] | add // 0' "$WORK_DIR/instances.json")
+          MICRO_COUNT=$(jq '[.data[] |
+            select(.["lifecycle-state"] != "TERMINATED" and .shape == "VM.Standard.E2.1.Micro")] | length' \
+            "$WORK_DIR/instances.json")
+          OTHER_COMPUTE_COUNT=$(jq '[.data[] |
+            select(
+              .["lifecycle-state"] != "TERMINATED" and
+              .shape != "VM.Standard.A1.Flex" and
+              .shape != "VM.Standard.E2.1.Micro")
+          ] | length' "$WORK_DIR/instances.json")
+          COMPUTE_SUMMARY=$(jq -c '[.data[] |
+            select(.["lifecycle-state"] != "TERMINATED") |
+            {name: .["display-name"], state: .["lifecycle-state"], shape: .shape,
+             ocpus: .["shape-config"].ocpus, memoryGB: .["shape-config"]["memory-in-gbs"]}]' \
+            "$WORK_DIR/instances.json")
+          echo "Non-terminated compute inventory (identifiers omitted): $COMPUTE_SUMMARY"
 
           if [ "$OTHER_COMPUTE_COUNT" != "0" ]; then
-            trip_guard "A non-A1 compute resource is outside the zero-cost allowlist."
+            trip_guard "A compute resource is outside the A1/E2.1.Micro zero-cost allowlist."
+          fi
+          if [ "$MICRO_COUNT" -gt 2 ]; then
+            trip_guard "More than two E2.1.Micro instances exist."
           fi
           if ! jq -ne \
             --argjson ocpus "$A1_OCPUS" \
@@ -187,4 +202,4 @@ jobs:
             echo "Usage API billing data was unavailable; inventory gates still passed. Billing data is delayed and remains a secondary guard." >&2
           fi
 
-          echo "Zero-cost inventory gates passed: A1=${A1_OCPUS} OCPU/${A1_MEMORY} GB, storage=${STORAGE_GB} GB."
+          echo "Zero-cost inventory gates passed: A1=${A1_OCPUS} OCPU/${A1_MEMORY} GB, E2.1.Micro=${MICRO_COUNT}, storage=${STORAGE_GB} GB."
