@@ -1,0 +1,218 @@
+name: Enable Restricted OCI SSH
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: Apply the verified TCP/22 rule
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oci-restricted-ssh-access
+  cancel-in-progress: false
+
+env:
+  COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+  OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+  OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+  OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+  OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+  OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+  OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+  SSH_ALLOWED_CIDR: ${{ secrets.SSH_ALLOWED_CIDR }}
+  INSTANCE_NAME: oci-free-arm-vm
+  APPLY_CHANGE: ${{ inputs.apply }}
+
+jobs:
+  restricted-ssh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Cache OCI CLI
+        uses: actions/cache@v5
+        with:
+          path: ~/.local
+          key: ${{ runner.os }}-pip-oci-cli-v1
+
+      - name: Add OCI CLI to PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install OCI CLI and SDK
+        run: pip install --user oci-cli
+
+      - name: Configure OCI CLI
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "${OCI_CLI_KEY_CONTENT}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${OCI_CLI_USER}
+          tenancy=${OCI_CLI_TENANCY}
+          fingerprint=${OCI_CLI_FINGERPRINT}
+          key_file=~/.oci/oci_api_key.pem
+          region=${OCI_CLI_REGION}
+          EOF
+
+      - name: Preflight and optionally add the restricted SSH rule
+        run: |
+          python - <<'PY'
+          import ipaddress
+          import os
+          import sys
+          import time
+
+          import oci
+          from oci.exceptions import ServiceError
+
+
+          def refuse(message):
+              print(message)
+              raise SystemExit(1)
+
+
+          def has_restricted_ssh_rule(rule, source_cidr):
+              if rule.source != source_cidr:
+                  return False
+              if rule.source_type != "CIDR_BLOCK":
+                  return False
+              if rule.is_stateless is not False or rule.protocol != "6":
+                  return False
+              if rule.tcp_options is None:
+                  return False
+              port_range = rule.tcp_options.destination_port_range
+              if port_range is None:
+                  return False
+              return port_range.min == 22 and port_range.max == 22
+
+
+          compartment_id = os.environ.get("COMPARTMENT_ID", "").strip()
+          instance_name = os.environ.get("INSTANCE_NAME", "").strip()
+          source_cidr = os.environ.get("SSH_ALLOWED_CIDR", "").strip()
+          apply_change = os.environ.get("APPLY_CHANGE", "false").lower() == "true"
+
+          if not compartment_id or not instance_name or not source_cidr:
+              refuse("A required OCI identifier or the restricted SSH source is missing.")
+
+          try:
+              allowed_network = ipaddress.ip_network(source_cidr, strict=True)
+          except ValueError:
+              refuse("The SSH source must be one canonical IPv4 /32 network.")
+          if allowed_network.version != 4 or allowed_network.prefixlen != 32 or not allowed_network.is_global:
+              refuse("The SSH source must be one global IPv4 /32 network.")
+
+          try:
+              config = oci.config.from_file()
+              compute = oci.core.ComputeClient(config)
+              virtual_network = oci.core.VirtualNetworkClient(config)
+
+              instances = oci.pagination.list_call_get_all_results(
+                  compute.list_instances,
+                  compartment_id,
+                  display_name=instance_name,
+              ).data
+              targets = [instance for instance in instances if instance.lifecycle_state != "TERMINATED"]
+              if len(targets) != 1:
+                  refuse("Expected exactly one non-terminated target instance; refusing to guess.")
+              instance = targets[0]
+              if instance.lifecycle_state != "RUNNING":
+                  refuse("The target instance is not RUNNING; refusing a network change.")
+
+              attachments = oci.pagination.list_call_get_all_results(
+                  compute.list_vnic_attachments,
+                  compartment_id,
+                  instance_id=instance.id,
+              ).data
+              attached = [item for item in attachments if item.lifecycle_state == "ATTACHED"]
+              if len(attached) != 1:
+                  refuse("Expected exactly one attached VNIC; refusing to guess.")
+
+              vnic = virtual_network.get_vnic(attached[0].vnic_id).data
+              if not vnic.public_ip or not vnic.subnet_id:
+                  refuse("The target VNIC has no public SSH endpoint.")
+
+              subnet = virtual_network.get_subnet(vnic.subnet_id).data
+              security_list_ids = subnet.security_list_ids or []
+              if len(security_list_ids) != 1:
+                  refuse("Expected exactly one subnet security list; refusing to guess.")
+
+              security_list_response = virtual_network.get_security_list(security_list_ids[0])
+              etag = security_list_response.headers.get("etag")
+              if not etag:
+                  refuse("OCI did not return an ETag; refusing an unsafe replacement update.")
+              original_rules = list(security_list_response.data.ingress_security_rules or [])
+              already_present = any(has_restricted_ssh_rule(rule, source_cidr) for rule in original_rules)
+
+              print(f"TARGET_INSTANCE_STATE={instance.lifecycle_state}")
+              print(f"SECURITY_LIST_COUNT={len(security_list_ids)}")
+              print(f"ORIGINAL_INGRESS_RULE_COUNT={len(original_rules)}")
+              print(f"SSH_RULE_ALREADY_PRESENT={str(already_present).lower()}")
+
+              if already_present:
+                  print("SSH_RULE_STATUS=UNCHANGED")
+                  raise SystemExit(0)
+
+              proposed_rules = original_rules + [
+                  oci.core.models.IngressSecurityRule(
+                      description="Restricted SSH from the current administrator address",
+                      is_stateless=False,
+                      protocol="6",
+                      source=source_cidr,
+                      source_type="CIDR_BLOCK",
+                      tcp_options=oci.core.models.TcpOptions(
+                          destination_port_range=oci.core.models.PortRange(min=22, max=22)
+                      ),
+                  )
+              ]
+              if len(proposed_rules) != len(original_rules) + 1:
+                  refuse("The proposed ingress rule set failed its count invariant.")
+
+              if not apply_change:
+                  print("DRY_RUN_OK=true")
+                  print("SSH_RULE_STATUS=DRY_RUN")
+                  raise SystemExit(0)
+
+              update_response = virtual_network.update_security_list(
+                  security_list_ids[0],
+                  oci.core.models.UpdateSecurityListDetails(
+                      ingress_security_rules=proposed_rules
+                  ),
+                  if_match=etag,
+              )
+              updated_etag = update_response.headers.get("etag")
+              if not updated_etag:
+                  refuse("OCI updated the rule set without returning an ETag; verification is unsafe.")
+
+              verified = False
+              verified_count = 0
+              for _ in range(6):
+                  current_response = virtual_network.get_security_list(security_list_ids[0])
+                  current_etag = current_response.headers.get("etag")
+                  if current_etag not in (etag, updated_etag):
+                      refuse("The security list changed concurrently after the SSH update.")
+                  current_rules = list(current_response.data.ingress_security_rules or [])
+                  verified_count = len(current_rules)
+                  if (
+                      current_etag == updated_etag
+                      and any(has_restricted_ssh_rule(rule, source_cidr) for rule in current_rules)
+                  ):
+                      verified = True
+                      break
+                  time.sleep(2)
+
+              if not verified or verified_count != len(proposed_rules):
+                  refuse("The SSH rule update could not be verified exactly.")
+
+              print(f"VERIFIED_INGRESS_RULE_COUNT={verified_count}")
+              print("SSH_RULE_STATUS=CREATED")
+          except ServiceError as error:
+              print(f"OCI_SERVICE_ERROR_STATUS={error.status}")
+              print(f"OCI_SERVICE_ERROR_CODE={error.code}")
+              raise SystemExit(1)
+          PY
