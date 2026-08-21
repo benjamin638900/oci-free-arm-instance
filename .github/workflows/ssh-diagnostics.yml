@@ -1,0 +1,143 @@
+name: OCI SSH Diagnostics
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+  OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+  OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+  OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+  OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+  OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+  OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+  SUPPRESS_LABEL_WARNING: "True"
+  INSTANCE_NAME: oci-free-arm-vm
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Cache OCI CLI
+        uses: actions/cache@v5
+        with:
+          path: ~/.local
+          key: ${{ runner.os }}-pip-oci-cli-v1
+
+      - name: Add OCI CLI to PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install OCI CLI
+        run: pip install --user oci-cli
+
+      - name: Configure OCI CLI
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "${OCI_CLI_KEY_CONTENT}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${OCI_CLI_USER}
+          tenancy=${OCI_CLI_TENANCY}
+          fingerprint=${OCI_CLI_FINGERPRINT}
+          key_file=~/.oci/oci_api_key.pem
+          region=${OCI_CLI_REGION}
+          EOF
+
+      - name: Inspect the SSH endpoint without exposing its address
+        run: |
+          set -euo pipefail
+
+          INSTANCES=$(oci compute instance list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --display-name "$INSTANCE_NAME" \
+            --all)
+          INSTANCE_COUNT=$(jq '[.data[] | select(.["lifecycle-state"] != "TERMINATED")] | length' <<<"$INSTANCES")
+          if [ "$INSTANCE_COUNT" != "1" ]; then
+            echo "Expected exactly one non-terminated target instance; refusing to guess."
+            exit 1
+          fi
+
+          INSTANCE_ID=$(jq -r '.data[] | select(.["lifecycle-state"] != "TERMINATED") | .id' <<<"$INSTANCES")
+          INSTANCE_STATE=$(jq -r '.data[] | select(.["lifecycle-state"] != "TERMINATED") | .["lifecycle-state"]' <<<"$INSTANCES")
+          VNICS=$(oci compute instance list-vnics --instance-id "$INSTANCE_ID")
+          VNIC_COUNT=$(jq '.data | length' <<<"$VNICS")
+          if [ "$VNIC_COUNT" != "1" ]; then
+            echo "Expected exactly one VNIC; refusing to guess."
+            exit 1
+          fi
+
+          PUBLIC_IP=$(jq -r '.data[0]["public-ip"] // empty' <<<"$VNICS")
+          SUBNET_ID=$(jq -r '.data[0]["subnet-id"] // empty' <<<"$VNICS")
+          if [ -z "$PUBLIC_IP" ] || [ -z "$SUBNET_ID" ]; then
+            echo "The target instance has no usable public SSH endpoint."
+            exit 1
+          fi
+          echo "::add-mask::$PUBLIC_IP"
+
+          SSH_INGRESS_RULE_PRESENT=false
+          SUBNET=$(oci network subnet get --subnet-id "$SUBNET_ID")
+          mapfile -t SECURITY_LIST_IDS < <(jq -r '.data["security-list-ids"][]?' <<<"$SUBNET")
+          for SECURITY_LIST_ID in "${SECURITY_LIST_IDS[@]}"; do
+            RULES=$(oci network security-list get --security-list-id "$SECURITY_LIST_ID")
+            if jq -e '.data["ingress-security-rules"][]? |
+              select(.protocol == "6") |
+              select(
+                .["tcp-options"] == null or
+                .["tcp-options"].["destination-port-range"] == null or
+                ((.["tcp-options"].["destination-port-range"].min // 0) <= 22 and
+                 (.["tcp-options"].["destination-port-range"].max // 65535) >= 22)
+              )' <<<"$RULES" >/dev/null; then
+              SSH_INGRESS_RULE_PRESENT=true
+            fi
+          done
+
+          mapfile -t NSG_IDS < <(jq -r '.data[0]["nsg-ids"][]?' <<<"$VNICS")
+          for NSG_ID in "${NSG_IDS[@]}"; do
+            RULES=$(oci network nsg rules list --nsg-id "$NSG_ID" --direction INGRESS --all)
+            if jq -e '.data[]? |
+              select(.protocol == "6") |
+              select(
+                .["tcp-options"] == null or
+                .["tcp-options"].["destination-port-range"] == null or
+                ((.["tcp-options"].["destination-port-range"].min // 0) <= 22 and
+                 (.["tcp-options"].["destination-port-range"].max // 65535) >= 22)
+              )' <<<"$RULES" >/dev/null; then
+              SSH_INGRESS_RULE_PRESENT=true
+            fi
+          done
+
+          cat > "$RUNNER_TEMP/diagnostic_public.pem" <<'EOF'
+          -----BEGIN PUBLIC KEY-----
+          MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEA5TQoQuv78NRF/fPoTISr
+          +D4fX0S78ctLSKUjMX5oPc/y3vzfDKKzkQt5fug+LXj5+ZppDRMl43x79fYe77zO
+          PD0M/QBZBVFNzLMl3wfsRAHKoswnBsZSGI8CR6Dh2gJkNBj9JaH8fcagtwh1Jmpc
+          pt3fDZd7Ajq/yLUQXp/naalxZ0PuVeLD83uuT64o50mgNkjrNvDjmvIYLeoO7WAr
+          hZ3LYergPZAbSdV8+0FePnBMdb9ohIlIqkZl1N4LFDYK+Xdl9Bzs3pb2Ltiv7bt7
+          gGr75auWKA7sKffAgpZRvpQYSJnoQ4lhj3VVyc8U1qmQBnEPQxCbGtSJkwYVBrpJ
+          /stExHmk1JEanVhXS46J7h1BZLSmWFE0sB6BwTMFJgBUVzC3vSh2q+ifymyLLUVt
+          Xvs6awW/SU5+LI0SW3MJRqwmCibVEExNTG3YtqauEwSvDf5c/Z3eERe5oWfInJkc
+          OFXrcHOPMjEO0StXjJ+COp+HLas2tWTsKJQ/xemvoP/nAgMBAAE=
+          -----END PUBLIC KEY-----
+          EOF
+
+          PAYLOAD=$(jq -nc \
+            --arg publicIp "$PUBLIC_IP" \
+            --arg sshUser "ubuntu" \
+            --argjson port 22 \
+            --arg state "$INSTANCE_STATE" \
+            '{publicIp:$publicIp,sshUser:$sshUser,port:$port,state:$state}')
+          CIPHERTEXT=$(printf '%s' "$PAYLOAD" | openssl pkeyutl -encrypt \
+            -pubin \
+            -inkey "$RUNNER_TEMP/diagnostic_public.pem" \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            | base64 -w0)
+
+          echo "SSH_INGRESS_RULE_PRESENT=$SSH_INGRESS_RULE_PRESENT"
+          echo "ENCRYPTED_SSH_ENDPOINT=$CIPHERTEXT"
