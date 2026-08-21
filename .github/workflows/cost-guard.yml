@@ -1,0 +1,190 @@
+name: OCI Zero Cost Guard
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: oci-cost-guard
+  cancel-in-progress: false
+
+env:
+  COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+  OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+  OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+  OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+  OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+  OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+  OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+  SUPPRESS_LABEL_WARNING: "True"
+  INSTANCE_NAME: oci-free-arm-vm
+  MAX_A1_OCPUS: "2"
+  MAX_A1_MEMORY_GB: "12"
+  MAX_HOME_STORAGE_GB: "150"
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Cache OCI CLI
+        uses: actions/cache@v5
+        with:
+          path: ~/.local
+          key: ${{ runner.os }}-pip-oci-cli-v1
+
+      - name: Add OCI CLI to PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install OCI CLI
+        run: pip install --user oci-cli
+
+      - name: Configure OCI CLI
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "${OCI_CLI_KEY_CONTENT}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${OCI_CLI_USER}
+          tenancy=${OCI_CLI_TENANCY}
+          fingerprint=${OCI_CLI_FINGERPRINT}
+          key_file=~/.oci/oci_api_key.pem
+          region=${OCI_CLI_REGION}
+          EOF
+
+      - name: Enforce inventory and cost guardrails
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          oci_fast() {
+            oci --no-retry --connection-timeout 5 --read-timeout 30 "$@"
+          }
+
+          disable_creator() {
+            gh workflow disable create-vm.yml --repo "$GITHUB_REPOSITORY" || true
+          }
+
+          stop_target_a1_instances() {
+            local id state
+            while IFS=$'\t' read -r id state; do
+              [ -n "$id" ] || continue
+              case "$state" in
+                RUNNING|STARTING)
+                  echo "Stopping a target A1 instance because a zero-cost guardrail was breached."
+                  oci_fast compute instance action --instance-id "$id" --action STOP --force || true
+                  ;;
+              esac
+            done < <(jq -r --arg name "$INSTANCE_NAME" '.data[] |
+              select(.["display-name"] == $name and .shape == "VM.Standard.A1.Flex" and .["lifecycle-state"] != "TERMINATED") |
+              [.id, .["lifecycle-state"]] | @tsv' "$WORK_DIR/instances.json")
+          }
+
+          trip_guard() {
+            echo "$1" >&2
+            disable_creator
+            stop_target_a1_instances
+            exit 1
+          }
+
+          if [ "$OCI_CLI_REGION" != "us-phoenix-1" ]; then
+            echo "Cost guard only permits the verified home region us-phoenix-1."
+            disable_creator
+            exit 1
+          fi
+
+          WORK_DIR=$(mktemp -d)
+          trap 'rm -rf "$WORK_DIR"' EXIT
+
+          oci_fast compute instance list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --all >"$WORK_DIR/instances.json"
+
+          OTHER_COMPUTE_COUNT=$(jq '[.data[] |
+            select(.["lifecycle-state"] != "TERMINATED" and .shape != "VM.Standard.A1.Flex")] | length' \
+            "$WORK_DIR/instances.json")
+          A1_OCPUS=$(jq '[.data[] |
+            select(.["lifecycle-state"] != "TERMINATED" and .shape == "VM.Standard.A1.Flex") |
+            .["shape-config"].ocpus // 0] | add // 0' "$WORK_DIR/instances.json")
+          A1_MEMORY=$(jq '[.data[] |
+            select(.["lifecycle-state"] != "TERMINATED" and .shape == "VM.Standard.A1.Flex") |
+            .["shape-config"]["memory-in-gbs"] // 0] | add // 0' "$WORK_DIR/instances.json")
+
+          if [ "$OTHER_COMPUTE_COUNT" != "0" ]; then
+            trip_guard "A non-A1 compute resource is outside the zero-cost allowlist."
+          fi
+          if ! jq -ne \
+            --argjson ocpus "$A1_OCPUS" \
+            --argjson memory "$A1_MEMORY" \
+            --argjson maxOcpus "$MAX_A1_OCPUS" \
+            --argjson maxMemory "$MAX_A1_MEMORY_GB" \
+            '($ocpus <= $maxOcpus) and ($memory <= $maxMemory)' >/dev/null; then
+            trip_guard "A1 usage exceeds the verified 2 OCPU / 12 GB allowance."
+          fi
+
+          oci_fast iam availability-domain list \
+            --compartment-id "$OCI_CLI_TENANCY" >"$WORK_DIR/ads.json"
+          : >"$WORK_DIR/boot-volumes.ndjson"
+          : >"$WORK_DIR/block-volumes.ndjson"
+          while IFS= read -r ad; do
+            oci_fast bv boot-volume list \
+              --compartment-id "$COMPARTMENT_ID" \
+              --availability-domain "$ad" \
+              --all \
+              | jq -c '.data[] | select(.["lifecycle-state"] != "TERMINATED" and .["lifecycle-state"] != "TERMINATING") | {sizeGB: .["size-in-gbs"]}' \
+              >>"$WORK_DIR/boot-volumes.ndjson"
+            oci_fast bv volume list \
+              --compartment-id "$COMPARTMENT_ID" \
+              --availability-domain "$ad" \
+              --all \
+              | jq -c '.data[] | select(.["lifecycle-state"] != "TERMINATED" and .["lifecycle-state"] != "TERMINATING") | {sizeGB: .["size-in-gbs"]}' \
+              >>"$WORK_DIR/block-volumes.ndjson"
+          done < <(jq -r '.data[].name' "$WORK_DIR/ads.json")
+
+          STORAGE_GB=$(jq -s '[.[].sizeGB // 0] | add // 0' \
+            "$WORK_DIR/boot-volumes.ndjson" "$WORK_DIR/block-volumes.ndjson")
+          if [ "$STORAGE_GB" -gt "$MAX_HOME_STORAGE_GB" ]; then
+            trip_guard "Home-region boot + block storage exceeds the conservative 150 GB envelope."
+          fi
+
+          MONTH_START=$(date -u +%Y-%m-01T00:00:00Z)
+          USAGE_END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          if oci_fast usage-api usage-summary request-summarized-usages \
+            --tenant-id "$OCI_CLI_TENANCY" \
+            --time-usage-started "$MONTH_START" \
+            --time-usage-ended "$USAGE_END" \
+            --granularity MONTHLY \
+            --query-type COST \
+            --group-by '["service","skuName","resourceId"]' \
+            >"$WORK_DIR/cost.json"; then
+            NONZERO_COST=$(jq '[.data.items[]? | .["computed-amount"] // 0 | select(. > 0)] | add // 0' "$WORK_DIR/cost.json")
+            if ! jq -ne --argjson cost "$NONZERO_COST" '$cost == 0' >/dev/null; then
+              echo "OCI Usage API reports a non-zero month-to-date cost; identifiers and amounts are intentionally omitted." >&2
+              disable_creator
+              mapfile -t BILLED_TARGET_IDS < <(jq -r --arg name "$INSTANCE_NAME" --slurpfile instances "$WORK_DIR/instances.json" '
+                [.data.items[]? |
+                  select((.["computed-amount"] // 0) > 0) |
+                  .["resource-id"] as $billedId |
+                  $instances[0].data[] |
+                  select(.id == $billedId and .["display-name"] == $name and .shape == "VM.Standard.A1.Flex" and .["lifecycle-state"] != "TERMINATED") |
+                  .id] | unique[]' "$WORK_DIR/cost.json")
+              for id in "${BILLED_TARGET_IDS[@]}"; do
+                echo "Stopping a billed target A1 instance."
+                oci_fast compute instance action --instance-id "$id" --action STOP --force || true
+              done
+              exit 1
+            fi
+            echo "Usage API cost gate passed at the latest available billing snapshot."
+          else
+            echo "Usage API billing data was unavailable; inventory gates still passed. Billing data is delayed and remains a secondary guard." >&2
+          fi
+
+          echo "Zero-cost inventory gates passed: A1=${A1_OCPUS} OCPU/${A1_MEMORY} GB, storage=${STORAGE_GB} GB."

@@ -15,6 +15,7 @@ concurrency:
 
 env:
   COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+  RETAINED_BOOT_VOLUME_ID: ${{ secrets.OCI_BOOT_VOLUME_ID }}
   IMAGE_ID: ${{ secrets.IMAGE_ID }}
   SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
   OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
@@ -26,10 +27,15 @@ env:
   SUPPRESS_LABEL_WARNING: "True"
   INSTANCE_NAME: oci-free-arm-vm
   SHAPE: VM.Standard.A1.Flex
-  REQUEST_OCPUS: "1"
-  REQUEST_MEMORY_GB: "6"
+  REQUEST_OCPUS: "2"
+  REQUEST_MEMORY_GB: "12"
   REQUEST_BOOT_GB: "50"
   REQUEST_VPUS_PER_GB: "10"
+  MAX_A1_OCPUS: "2"
+  MAX_A1_MEMORY_GB: "12"
+  MAX_HOME_STORAGE_GB: "150"
+  RETAINED_BOOT_GB: "100"
+  RETAINED_BOOT_AD_SUFFIX: "PHX-AD-3"
 
 jobs:
   try-create-vm:
@@ -195,7 +201,7 @@ jobs:
             exit 1
           fi
 
-          for value in "$COMPARTMENT_ID" "$IMAGE_ID" "$SUBNET_ID" "$OCI_CLI_TENANCY"; do
+          for value in "$COMPARTMENT_ID" "$RETAINED_BOOT_VOLUME_ID" "$IMAGE_ID" "$SUBNET_ID" "$OCI_CLI_TENANCY"; do
             if [ -z "$value" ]; then
               echo "A required OCI identifier is missing."
               exit 1
@@ -252,6 +258,24 @@ jobs:
             esac
           done
 
+          RETAINED_INFO=$(oci_fast bv boot-volume get \
+            --boot-volume-id "$RETAINED_BOOT_VOLUME_ID" \
+            --query 'data.{state:"lifecycle-state",ad:"availability-domain",sizeGB:"size-in-gbs",vpusPerGB:"vpus-per-gb"}')
+          RETAINED_STATE=$(jq -r '.state // empty' <<<"$RETAINED_INFO")
+          RETAINED_AD=$(jq -r '.ad // empty' <<<"$RETAINED_INFO")
+          RETAINED_SIZE_GB=$(jq -r '.sizeGB // empty' <<<"$RETAINED_INFO")
+          RETAINED_VPUS=$(jq -r '.vpusPerGB // empty' <<<"$RETAINED_INFO")
+          RETAINED_AD_MATCHES=$(printf '%s\n' "${ADS[@]}" | awk -v retained="$RETAINED_AD" '$0 == retained {count++} END {print count+0}')
+          if [ "$RETAINED_STATE" != "AVAILABLE" ] || \
+             [ "$RETAINED_SIZE_GB" != "$RETAINED_BOOT_GB" ] || \
+             [ "$RETAINED_VPUS" != "$REQUEST_VPUS_PER_GB" ] || \
+             [ "$RETAINED_AD_MATCHES" != "1" ] || \
+             [[ "$RETAINED_AD" != *:"$RETAINED_BOOT_AD_SUFFIX" ]]; then
+            echo "The retained boot volume is not the expected detached 100 GB Balanced PHX-AD-3 source; refusing to launch."
+            exit 1
+          fi
+          echo "Retained boot volume gate passed (identifiers omitted)."
+
           : >"$WORK_DIR/boot-volumes.ndjson"
           : >"$WORK_DIR/block-volumes.ndjson"
           for AD in "${ADS[@]}"; do
@@ -259,7 +283,7 @@ jobs:
               --compartment-id "$COMPARTMENT_ID" \
               --availability-domain "$AD" \
               --all \
-              | jq -c '.data[] | select(.["lifecycle-state"] != "TERMINATED" and .["lifecycle-state"] != "TERMINATING") | {sizeGB: .["size-in-gbs"]}' \
+              | jq -c '.data[] | select(.["lifecycle-state"] != "TERMINATED" and .["lifecycle-state"] != "TERMINATING") | {id: .id, sizeGB: .["size-in-gbs"]}' \
               >>"$WORK_DIR/boot-volumes.ndjson"
             oci_list bv volume list \
               --compartment-id "$COMPARTMENT_ID" \
@@ -270,10 +294,15 @@ jobs:
           done
           CURRENT_BOOT_GB=$(jq -sc '[.[].sizeGB // 0] | add // 0' "$WORK_DIR/boot-volumes.ndjson")
           CURRENT_BLOCK_GB=$(jq -sc '[.[].sizeGB // 0] | add // 0' "$WORK_DIR/block-volumes.ndjson")
+          RETAINED_MATCHES=$(jq -sc --arg id "$RETAINED_BOOT_VOLUME_ID" '[.[] | select(.id == $id)] | length' "$WORK_DIR/boot-volumes.ndjson")
+          if [ "$RETAINED_MATCHES" != "1" ]; then
+            echo "The retained boot volume is not present exactly once in the home-region inventory."
+            exit 1
+          fi
           PROJECTED_STORAGE_GB=$((CURRENT_BOOT_GB + CURRENT_BLOCK_GB + REQUEST_BOOT_GB))
           echo "Projected boot + block storage after launch: ${PROJECTED_STORAGE_GB} GB."
-          if [ "$PROJECTED_STORAGE_GB" -gt 150 ]; then
-            echo "Launch would exceed the target envelope of one retained 100 GB disk plus one 50 GB instance disk."
+          if [ "$PROJECTED_STORAGE_GB" -gt "$MAX_HOME_STORAGE_GB" ]; then
+            echo "Launch would exceed the conservative home-region storage envelope."
             exit 1
           fi
 
@@ -283,12 +312,24 @@ jobs:
             >"$WORK_DIR/instances.json"
           CURRENT_A1_OCPUS=$(jq '[.data[] | select(.["lifecycle-state"] != "TERMINATED" and .shape == "VM.Standard.A1.Flex") | .["shape-config"].ocpus // 0] | add // 0' "$WORK_DIR/instances.json")
           CURRENT_A1_MEMORY=$(jq '[.data[] | select(.["lifecycle-state"] != "TERMINATED" and .shape == "VM.Standard.A1.Flex") | .["shape-config"]["memory-in-gbs"] // 0] | add // 0' "$WORK_DIR/instances.json")
-          if ! jq -ne --argjson ocpus "$CURRENT_A1_OCPUS" --argjson memory "$CURRENT_A1_MEMORY" \
-            '($ocpus == 0) and ($memory == 0)' >/dev/null; then
-            echo "Existing A1 usage already consumes the single-instance target envelope; refusing another launch."
+          OTHER_COMPUTE_COUNT=$(jq '[.data[] | select(.["lifecycle-state"] != "TERMINATED" and .shape != "VM.Standard.A1.Flex")] | length' "$WORK_DIR/instances.json")
+          if [ "$OTHER_COMPUTE_COUNT" != "0" ]; then
+            echo "A non-A1 compute resource exists outside the zero-cost allowlist; refusing another launch."
+            disable_workflow
             exit 1
           fi
-          echo "A1 compute gate passed for one 1 OCPU/6 GB target instance."
+          if ! jq -ne \
+            --argjson currentOcpus "$CURRENT_A1_OCPUS" \
+            --argjson currentMemory "$CURRENT_A1_MEMORY" \
+            --argjson requestOcpus "$REQUEST_OCPUS" \
+            --argjson requestMemory "$REQUEST_MEMORY_GB" \
+            --argjson maxOcpus "$MAX_A1_OCPUS" \
+            --argjson maxMemory "$MAX_A1_MEMORY_GB" \
+            '(($currentOcpus + $requestOcpus) <= $maxOcpus) and (($currentMemory + $requestMemory) <= $maxMemory)' >/dev/null; then
+            echo "The launch would exceed the verified 2 OCPU / 12 GB A1 allowance; refusing another launch."
+            exit 1
+          fi
+          echo "A1 compute gate passed for one 2 OCPU / 12 GB target instance."
 
           for AD in "${ADS[@]}"; do
             SHAPES=$(oci_list compute shape list \
@@ -303,11 +344,13 @@ jobs:
           done
           echo "Image/shape compatibility gate passed for all Phoenix ADs."
 
+          mapfile -t ORDERED_ADS < <(printf '%s\n' "${ADS[@]}" | awk -v retained="$RETAINED_AD" '$0 == retained {print; next} {other[++n]=$0} END {for (i=1; i<=n; i++) print other[i]}')
+
           END_TIME=$((SECONDS + 55 * 60))
           ATTEMPT=0
           while [ "$SECONDS" -lt "$END_TIME" ]; do
             ATTEMPT=$((ATTEMPT + 1))
-            for AD in "${ADS[@]}"; do
+            for AD in "${ORDERED_ADS[@]}"; do
               if handle_existing_instance; then
                 exit 0
               else
@@ -320,6 +363,13 @@ jobs:
               fi
 
               echo "Capacity attempt $ATTEMPT in ${AD##*:}."
+              if [ "$AD" = "$RETAINED_AD" ]; then
+                SOURCE_DETAILS="{\"sourceType\":\"bootVolume\",\"bootVolumeId\":\"${RETAINED_BOOT_VOLUME_ID}\"}"
+                SOURCE_LABEL="retained-boot-volume"
+              else
+                SOURCE_DETAILS="{\"sourceType\":\"image\",\"imageId\":\"${IMAGE_ID}\",\"bootVolumeSizeInGBs\":${REQUEST_BOOT_GB},\"bootVolumeVpusPerGB\":${REQUEST_VPUS_PER_GB}}"
+                SOURCE_LABEL="always-free-image"
+              fi
               set +e
               OCI_OUTPUT=$(oci_fast compute instance launch \
                 --compartment-id "$COMPARTMENT_ID" \
@@ -327,11 +377,11 @@ jobs:
                 --shape "$SHAPE" \
                 --shape-config "{\"ocpus\":${REQUEST_OCPUS},\"memoryInGBs\":${REQUEST_MEMORY_GB}}" \
                 --subnet-id "$SUBNET_ID" \
-                --source-details "{\"sourceType\":\"image\",\"imageId\":\"${IMAGE_ID}\",\"bootVolumeSizeInGBs\":${REQUEST_BOOT_GB},\"bootVolumeVpusPerGB\":${REQUEST_VPUS_PER_GB}}" \
+                --source-details "$SOURCE_DETAILS" \
                 --ssh-authorized-keys-file /tmp/ssh_key.pub \
                 --assign-public-ip true \
                 --display-name "$INSTANCE_NAME" \
-                --freeform-tags '{"always-free":"phoenix-multi-ad"}' \
+                --freeform-tags "{\"always-free\":\"phoenix-multi-ad\",\"launch-source\":\"${SOURCE_LABEL}\"}" \
                 --query 'data.{id:id,state:"lifecycle-state"}' \
                 2>&1)
               EXIT_CODE=$?
