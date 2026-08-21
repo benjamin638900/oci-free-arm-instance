@@ -87,12 +87,14 @@ jobs:
           for SECURITY_LIST_ID in "${SECURITY_LIST_IDS[@]}"; do
             RULES=$(oci network security-list get --security-list-id "$SECURITY_LIST_ID")
             if jq -e '.data["ingress-security-rules"][]? |
-              select(.protocol == "6") |
               select(
-                .["tcp-options"] == null or
-                .["tcp-options"].["destination-port-range"] == null or
-                ((.["tcp-options"].["destination-port-range"].min // 0) <= 22 and
-                 (.["tcp-options"].["destination-port-range"].max // 65535) >= 22)
+                .protocol == "all" or
+                (.protocol == "6" and (
+                  .["tcp-options"] == null or
+                  .["tcp-options"].["destination-port-range"] == null or
+                  ((.["tcp-options"].["destination-port-range"].min // 0) <= 22 and
+                   (.["tcp-options"].["destination-port-range"].max // 65535) >= 22)
+                ))
               )' <<<"$RULES" >/dev/null; then
               SSH_INGRESS_RULE_PRESENT=true
             fi
@@ -102,12 +104,14 @@ jobs:
           for NSG_ID in "${NSG_IDS[@]}"; do
             RULES=$(oci network nsg rules list --nsg-id "$NSG_ID" --direction INGRESS --all)
             if jq -e '.data[]? |
-              select(.protocol == "6") |
               select(
-                .["tcp-options"] == null or
-                .["tcp-options"].["destination-port-range"] == null or
-                ((.["tcp-options"].["destination-port-range"].min // 0) <= 22 and
-                 (.["tcp-options"].["destination-port-range"].max // 65535) >= 22)
+                .protocol == "all" or
+                (.protocol == "6" and (
+                  .["tcp-options"] == null or
+                  .["tcp-options"].["destination-port-range"] == null or
+                  ((.["tcp-options"].["destination-port-range"].min // 0) <= 22 and
+                   (.["tcp-options"].["destination-port-range"].max // 65535) >= 22)
+                ))
               )' <<<"$RULES" >/dev/null; then
               SSH_INGRESS_RULE_PRESENT=true
             fi
@@ -130,13 +134,24 @@ jobs:
           printf '%s\n' "$SSH_PUBLIC_KEY" > "$RUNNER_TEMP/instance_ssh_key.pub"
           SSH_KEY_FINGERPRINT=$(ssh-keygen -lf "$RUNNER_TEMP/instance_ssh_key.pub" -E sha256 | awk '{print $2}')
 
+          RUN_COMMAND_STATUS="UNAVAILABLE"
+          if AGENT_PLUGINS=$(oci instance-agent plugin list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --instanceagent-id "$INSTANCE_ID" \
+            --all 2>/dev/null); then
+            RUN_COMMAND_STATUS=$(jq -r \
+              '[.data[]? | select((.name // "") | test("Run Command"; "i"))] | first | .status // "NOT_FOUND"' \
+              <<<"$AGENT_PLUGINS")
+          fi
+
           PAYLOAD=$(jq -nc \
             --arg publicIp "$PUBLIC_IP" \
             --arg sshUser "ubuntu" \
             --argjson port 22 \
             --arg state "$INSTANCE_STATE" \
             --arg sshKeyFingerprint "$SSH_KEY_FINGERPRINT" \
-            '{publicIp:$publicIp,sshUser:$sshUser,port:$port,state:$state,sshKeyFingerprint:$sshKeyFingerprint}')
+            --arg runCommandStatus "$RUN_COMMAND_STATUS" \
+            '{publicIp:$publicIp,sshUser:$sshUser,port:$port,state:$state,sshKeyFingerprint:$sshKeyFingerprint,runCommandStatus:$runCommandStatus}')
           CIPHERTEXT=$(printf '%s' "$PAYLOAD" | openssl pkeyutl -encrypt \
             -pubin \
             -inkey "$RUNNER_TEMP/diagnostic_public.pem" \
