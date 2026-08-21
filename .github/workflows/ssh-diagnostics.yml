@@ -13,6 +13,7 @@ env:
   OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
   OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
   OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+  SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
   OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
   SUPPRESS_LABEL_WARNING: "True"
   INSTANCE_NAME: oci-free-arm-vm
@@ -126,12 +127,16 @@ jobs:
           -----END PUBLIC KEY-----
           EOF
 
+          printf '%s\n' "$SSH_PUBLIC_KEY" > "$RUNNER_TEMP/instance_ssh_key.pub"
+          SSH_KEY_FINGERPRINT=$(ssh-keygen -lf "$RUNNER_TEMP/instance_ssh_key.pub" -E sha256 | awk '{print $2}')
+
           PAYLOAD=$(jq -nc \
             --arg publicIp "$PUBLIC_IP" \
             --arg sshUser "ubuntu" \
             --argjson port 22 \
             --arg state "$INSTANCE_STATE" \
-            '{publicIp:$publicIp,sshUser:$sshUser,port:$port,state:$state}')
+            --arg sshKeyFingerprint "$SSH_KEY_FINGERPRINT" \
+            '{publicIp:$publicIp,sshUser:$sshUser,port:$port,state:$state,sshKeyFingerprint:$sshKeyFingerprint}')
           CIPHERTEXT=$(printf '%s' "$PAYLOAD" | openssl pkeyutl -encrypt \
             -pubin \
             -inkey "$RUNNER_TEMP/diagnostic_public.pem" \
